@@ -4,6 +4,8 @@ Pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen
 
 Supports 0.6B and 1.7B models. Modes: offline, segmented, streaming, live capture, VAD live, forced alignment.
 
+On Apple M5, the current CPU implementation transcribes a 28.2s sample in **676ms median inference time** (**41.69x realtime**), faster than the upstream C implementation and the measured MLX GPU baselines.
+
 
 ## Auto Research
 
@@ -18,8 +20,8 @@ Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio). Im
 | qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 1,842 | 1,853 | 1,820 | 15.31x |
 | qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 676 | 678 | 668 | 41.69x |
 | pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,885 | 1,885 | 1,861 | 14.94x |
-| second-state MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
-| mlx-audio Python MLX | [`0.4.3`](https://github.com/Blaizzy/mlx-audio) | 801 | 820 | 788 | 35.16x |
+| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
+| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 801 | 820 | 788 | 35.16x |
 
 qwen-asr and pure C use internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization. Wall-clock time is still recorded for diagnostics and end-to-end command cost.
 
@@ -31,8 +33,8 @@ qwen-asr and pure C use internal inference timers. MLX-based implementations are
 | qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 2,171 | 2,205 | 2,150 | 12.99x |
 | qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 1,263 | 1,289 | 1,252 | 22.34x |
 | pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 2,154 | 2,148 | 2,125 | 13.08x |
-| second-state MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,982 | 3,049 | 2,940 | 9.44x |
-| mlx-audio Python MLX | [`0.4.3`](https://github.com/Blaizzy/mlx-audio) | 1,855 | 1,918 | 1,806 | 15.18x |
+| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,982 | 3,049 | 2,940 | 9.44x |
+| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 1,855 | 1,918 | 1,806 | 15.18x |
 
 </details>
 
@@ -43,13 +45,13 @@ qwen-asr and pure C use internal inference timers. MLX-based implementations are
 - **Fastest overall**: qwen-asr latest `0f5f065`
 - qwen-asr latest is **2.72x** faster than qwen-asr first `bf52daf` by median inference time
 - qwen-asr latest is **2.79x** faster than the upstream pure C implementation by median inference time
-- qwen-asr latest is **4.12x** faster than second-state MLX Metal GPU by median inference time
-- qwen-asr latest is **1.18x** faster than mlx-audio Python MLX (8-bit) by median inference time
+- qwen-asr latest is **4.12x** faster than [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU by median inference time
+- qwen-asr latest is **1.18x** faster than [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX (8-bit) by median inference time
 
 Reproduce all results:
 
 ```bash
-# qwen-asr first + latest + pure C + second-state MLX GPU + mlx-audio
+# qwen-asr first + latest + pure C + second-state/qwen3_asr_rs + mlx-audio
 ./bench/benchmark-all.sh --runs 10
 ```
 
