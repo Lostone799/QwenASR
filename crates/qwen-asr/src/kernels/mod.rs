@@ -468,7 +468,7 @@ pub fn add_inplace(a: &mut [f32], b: &[f32], n: usize) {
 // Matrix Operations
 // ========================================================================
 
-/// C = A @ B (no transpose): A[M,K], B[K,N], C[M,N]
+/// C = A @ B (no transpose): `A[M,K]`, `B[K,N]`, `C[M,N]`
 pub fn matmul_nn(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
     #[cfg(feature = "blas")]
     unsafe {
@@ -495,7 +495,7 @@ pub fn matmul_nn(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usi
     }
 }
 
-/// C = A @ B^T: A[M,K], B[N,K], C[M,N]
+/// C = A @ B^T: `A[M,K]`, `B[N,K]`, `C[M,N]`
 pub fn matmul_t(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
     #[cfg(feature = "blas")]
     unsafe {
@@ -522,7 +522,7 @@ pub fn matmul_t(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usiz
     }
 }
 
-/// y = x @ W^T + b: x[seq,in], W[out,in], b[out], y[seq,out]
+/// y = x @ W^T + b: `x[seq,in]`, `W[out,in]`, `b[out]`, `y[seq,out]`
 pub fn linear(y: &mut [f32], x: &[f32], w: &[f32], b: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize) {
     let _pg = ProfileGuard::new(&PROF.sgemm);
     #[cfg(feature = "blas")]
@@ -644,7 +644,7 @@ fn bf16_matvec_threaded(y: &mut [f32], x: &[f32], w_bf16: *const u16, bias: Opti
     });
 }
 
-/// Like linear_nobias_bf16 for seq_len=1, but ADDS to the destination: y[i] += W[i] @ x.
+/// Like linear_nobias_bf16 for seq_len=1, but ADDS to the destination: `y[i] += W[i] @ x`.
 /// Achieves fused residual add by passing y as its own "bias".
 pub fn linear_nobias_bf16_addto(y: &mut [f32], x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim: usize) {
     let _pg = ProfileGuard::new(&PROF.bf16_matvec);
@@ -759,7 +759,7 @@ pub fn linear_nobias_bf16_qkv(
 }
 
 /// Fused gate_up matvec + SwiGLU for single-token decode.
-/// Computes: ffn_out[j] = silu(gate[j]) * up[j] where gate/up come from interleaved gate_up_fused matvec.
+/// Computes: `ffn_out[j] = silu(gate[j]) * up[j]` where gate/up come from interleaved gate_up_fused matvec.
 /// Keeps gate_up output in L1 cache for the SwiGLU operation.
 pub fn linear_nobias_bf16_swiglu(
     ffn_out: &mut [f32],

@@ -382,7 +382,7 @@ pub unsafe fn rms_norm_row(out: &mut [f32], x: &[f32], weight: &[f32], hidden: u
     }
 }
 
-/// NEON-accelerated in-place RMS norm for a single row: x[i] = x[i] * rms_inv * weight[i].
+/// NEON-accelerated in-place RMS norm for a single row: `x[i] = x[i] * rms_inv * weight[i]`.
 ///
 /// # Safety
 /// Uses NEON intrinsics; x and weight must have at least `hidden` elements.
@@ -544,7 +544,7 @@ pub unsafe fn exp_inplace(x: &mut [f32]) {
     }
 }
 
-/// NEON-accelerated SwiGLU: out[j] = silu(gate[2j]) * gate[2j+1] for interleaved gate/up.
+/// NEON-accelerated SwiGLU: `out[j] = silu(gate[2j]) * gate[2j+1]` for interleaved gate/up.
 ///
 /// # Safety
 /// Uses NEON intrinsics; gate_up must have at least 2*n elements.
@@ -629,7 +629,7 @@ pub unsafe fn gelu_inplace(x: &mut [f32], n: usize) {
 }
 
 /// Quantize BF16 weight matrix to INT8 per-row with absmax scaling.
-/// Returns (int8_data, scales) where scales[row] is the per-row scale factor.
+/// Returns (int8_data, scales) where `scales[row]` is the per-row scale factor.
 ///
 /// # Safety
 /// w_bf16 must point to at least out_dim * in_dim valid bf16 values.
@@ -707,7 +707,7 @@ unsafe fn sdot_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t 
     acc
 }
 
-/// INT8 matvec: y = W_int8 @ x_int8 * (x_scale * w_scales[row])
+/// INT8 matvec: `y = W_int8 @ x_int8 * (x_scale * w_scales[row])`
 /// Produces f32 output. Optionally adds bias (for fused residual add).
 ///
 /// # Safety
@@ -793,8 +793,8 @@ pub unsafe fn matvec_int8(
 }
 
 /// INT8 argmax: find argmax of x @ W.T where W is int8-quantized.
-/// x_int8: quantized input [in_dim], x_scale: input quantization scale
-/// w_int8: quantized weights [out_dim, in_dim], w_scales: per-row scales [out_dim]
+/// x_int8: quantized input `[in_dim]`, x_scale: input quantization scale
+/// W_int8: quantized weights `[out_dim * in_dim]`, w_scales: per-row scales `[out_dim]`
 ///
 /// # Safety
 /// Uses NEON SDOT via inline asm. in_dim should be a multiple of 16 for best perf.

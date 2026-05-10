@@ -165,15 +165,7 @@ whitespace.
 
 ## Performance
 
-Benchmarks on Apple M2 Pro (10-core), 0.6B model:
-
-| Mode | Audio | Wall Time | Realtime Factor |
-|------|-------|-----------|-----------------|
-| Offline | 11 s | 1.8 s | 6.2x |
-| Offline | 28 s | 4.0 s | 7.0x |
-| Segmented (-S 30) | 45 s | 4.6 s | 9.8x |
-| Streaming | 28 s | 10.4 s | 2.7x |
-| Streaming (live) | 51 s | 14.1 s | 3.6x |
+Detailed, up-to-date benchmark results (including the latest optimizations that achieve **41+ RTF** on Apple Silicon) are published in the [main repository README](https://github.com/huanglizhuo/QwenASR).
 
 ## License
 

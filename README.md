@@ -1,10 +1,10 @@
 # qwen-asr
 
-Pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. Zero runtime crate deps (only `libc`). Ported from [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
+A **blazing fast**, pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. It features zero heavy runtime dependencies (only `libc`) and is ported from [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
 
-Supports 0.6B and 1.7B models. Modes: offline, segmented, streaming, live capture, VAD live, forced alignment.
+Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming, live capture, VAD live, and forced alignment.
 
-On Apple M5, the current CPU implementation transcribes a 28.2s sample in **676ms median inference time** (**41.69x realtime**), faster than the upstream C implementation and the measured MLX GPU baselines.
+**🚀 Extreme Performance:** On Apple Silicon (M5), the highly optimized CPU implementation transcribes a 28.2s audio sample in just **676ms** (**41.69x realtime**), outperforming both the upstream pure C implementation and measured MLX GPU baselines.
 
 
 ## Auto Research
@@ -13,14 +13,16 @@ Performance optimizations were discovered autonomously using the [autoresearch](
 
 ## Benchmark
 
-Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio). Implementations are benchmarked sequentially, not in parallel. The primary metric is median inference time, so model loading and process startup do not dominate comparisons.
+Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio using `bench/samples/audio.wav`). Implementations are benchmarked sequentially, not in parallel. The primary metric is median inference time, so model loading and process startup do not dominate comparisons.
+
+> **Note:** This is an ad-hoc, offline performance reference limited specifically to the Apple M5 architecture and a single audio sample. It is designed to quickly validate optimization efforts, rather than serving as a comprehensive industry-standard benchmark (such as LibriSpeech).
 
 | Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |
 |---|---:|---:|---:|---:|---:|
 | qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 1,842 | 1,853 | 1,820 | 15.31x |
 | qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 676 | 678 | 668 | 41.69x |
 | pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,885 | 1,885 | 1,861 | 14.94x |
-| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
+| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) with MLX backend | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
 | [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 801 | 820 | 788 | 35.16x |
 
 qwen-asr and pure C use internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization. Wall-clock time is still recorded for diagnostics and end-to-end command cost.
@@ -42,11 +44,11 @@ qwen-asr and pure C use internal inference timers. MLX-based implementations are
 
 ![Realtime factor](bench/charts/benchmark-unified-rtf.png)
 
-- **Fastest overall**: qwen-asr latest `0f5f065`
-- qwen-asr latest is **2.72x** faster than qwen-asr first `bf52daf` by median inference time
-- qwen-asr latest is **2.79x** faster than the upstream pure C implementation by median inference time
-- qwen-asr latest is **4.12x** faster than [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU by median inference time
-- qwen-asr latest is **1.18x** faster than [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX (8-bit) by median inference time
+- 🏆 **Fastest overall**: `qwen-asr` latest (`0f5f065`)
+- 🚀 **2.72x faster** than the initial Rust port (`bf52daf`)
+- 🔥 **2.79x faster** than the upstream pure C implementation (`b00b789`)
+- 💥 **4.12x faster** than [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU
+- ⚡️ **1.18x faster** than [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX (8-bit)
 
 Reproduce all results:
 
@@ -55,7 +57,7 @@ Reproduce all results:
 ./bench/benchmark-all.sh --runs 10
 ```
 
-### Why does pure CPU Rust beat GPU?
+### ⚡️ Why does pure CPU Rust beat GPU baselines?
 
 1. **Hand-optimized NEON kernels** — Custom `vDSP`/`Accelerate`, hand-written `neon_dotprod` matmul, and fused fast-attention specifically tuned for the 0.6B model and Apple Silicon cache hierarchy.
 2. **Zero framework overhead** — No tensor dispatch, memory pools, or FFI bridging. 100% Rust end-to-end.

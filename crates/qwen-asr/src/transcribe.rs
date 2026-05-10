@@ -566,7 +566,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
 /// Convenience wrapper: load a WAV file and transcribe it.
 ///
-/// Equivalent to [`audio::load_wav`](crate::audio::load_wav) followed by
+/// Equivalent to [`audio::load_wav`] followed by
 /// [`transcribe_audio`].
 pub fn transcribe(ctx: &mut QwenCtx, wav_path: &str) -> Option<String> {
     let samples = audio::load_wav(wav_path)?;
