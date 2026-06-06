@@ -112,7 +112,7 @@ fn usage(prog: &str) {
     eprintln!("  --list-devices              List available audio input devices and exit");
     eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
     eprintln!("\nOptions:");
-    eprintln!("  -t <n>        Number of threads (default: all CPUs)");
+    eprintln!("  -t <n>        Number of threads (default: performance cores)");
     eprintln!("  -S <secs>     Segment target seconds (default: 0 = full-audio decode)");
     eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
     eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
@@ -381,7 +381,7 @@ fn main() {
 
     // Initialize thread pool
     if n_threads <= 0 {
-        n_threads = kernels::get_num_cpus() as i32;
+        n_threads = kernels::get_num_perf_cpus() as i32;
     }
     kernels::set_threads(n_threads as usize);
 

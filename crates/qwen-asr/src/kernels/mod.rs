@@ -298,6 +298,34 @@ pub fn get_num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+/// Number of high-performance physical cores. On Apple Silicon this is
+/// `hw.perflevel0.physicalcpu` (P-cores). With the batched-attention decode
+/// path, both the encoder and (especially) the bandwidth-bound single-token
+/// decode run faster on the P-cores alone — adding efficiency cores increases
+/// dispatch and memory-bus contention and slows every measured mode. Falls back
+/// to total CPU count on other platforms / on failure.
+pub fn get_num_perf_cpus() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        let mut out: i32 = 0;
+        let mut size = std::mem::size_of::<i32>();
+        let name = b"hw.perflevel0.physicalcpu\0";
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr() as *const libc::c_char,
+                &mut out as *mut i32 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && out > 0 {
+            return out as usize;
+        }
+    }
+    get_num_cpus()
+}
+
 /// Run a closure in parallel using the persistent thread pool.
 /// The closure takes (thread_id, n_threads).
 fn parallel_for<F: Fn(usize, usize) + Send + Sync>(f: F) {

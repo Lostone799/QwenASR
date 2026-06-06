@@ -105,3 +105,32 @@ Change: the multi-token causal-attention path did two N=1 BLAS calls per (head, 
 
 Decision: **Accepted.** Halves prefill attention time; ~3-4% inference / ~2-3% wall improvement with zero WER impact. (Computes a few masked-out scores in the upper triangle, but real GEMMs vastly outweigh the eliminated per-call overhead.)
 
+## E9: parallel_for end backoff ❌  &  E10: pin workers to P-cores ❌
+
+Both are thread-placement / spin tweaks. The benchmark runs on an otherwise-idle 15-core machine (5 P + 10 E):
+
+- **E10** (restrict/pin workers to the 5 performance cores) is functionally identical to E1, which was measured and *regressed* the encoder-heavy offline path (the parallelized im2col/gelu/attention and Accelerate's own threading benefit from the efficiency cores). Rejected for the same reason.
+- **E9** (add `sched_yield`/backoff to the completion spin) cannot improve wall-time when cores are idle — the spinning thread occupies its own otherwise-free core, and yielding only adds wakeup latency. Its benefit (lower energy/contention) does not register on an isolated speed benchmark and risks a small latency regression.
+
+Decision: **Rejected** — no isolated-benchmark speed benefit; E10≡E1 (already shown to regress).
+
+## E1-revisited: default thread count = performance cores ✅ (after E8)
+
+While investigating decode threading, profiling a *real* (uncapped, 11.7s) clip showed decode dominates inference (decoding 382ms vs encoding 108ms) and is highly thread-count sensitive: the small, bandwidth-bound single-token matvecs slow down badly when spread across efficiency cores. Crucially, **after E8** (batched-GEMM attention changed the threading profile), fewer threads now wins on *every* mode — the opposite of E1's pre-E8 result.
+
+Stable medians (perf-core default = 5 vs old default = 15):
+
+| Metric | t15 (old) | t5 (perf cores) |
+|--------|-----------|-----------------|
+| offline wall / infer | 847 / 469 | **822 / 450** |
+| segmented wall / infer | 731 / 357 | **711 / 340** |
+| streaming wall / infer | 742 / 368 | **722 / 351** |
+| decode (real 11.7s clip) | 381ms | **286ms** (−25%) |
+
+Change: default thread count uses `hw.perflevel0.physicalcpu` (P-cores) instead of all CPUs.
+
+- 100-file offline WER: **0.0379** (≤0.04, marginally better than 0.0387 — FP accumulation order differs slightly with thread count)
+- Library tests: pass
+
+Decision: **Accepted.** Improves every benchmark mode and cuts real-world decode latency ~25%, with WER within the gate. (Note: a finer-grained attempt to cap *only* the decode matvecs to 4 threads while keeping the encoder at full width required thread-pool surgery that introduced a race; the global perf-core default is the safe form and captures essentially the same benefit since the encoder also prefers P-cores post-E8.)
+
