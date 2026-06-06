@@ -44,3 +44,64 @@ Measured load (tiny clip, instrumented): encoder 73→25ms, decoder 272→94ms; 
 
 Decision: **Accepted.** Large wall-clock win, zero inference/WER impact, zero quality risk. Note: profiling showed the decoder f32-prefill conversion is 164ms of the decoder load; E2 parallelizes it rather than removing it (see E3).
 
+## E3: lazy / on-demand f32 prefill weights ❌
+
+Idea: stop building the 1.76GB f32 prefill weight copies at load; convert bf16→f32 on the fly (or lazily) so load is cheaper and RAM drops.
+
+Analysis (settled from measured numbers rather than full implementation, which is invasive): every benchmark mode performs ~1 decoder prefill (offline 1; segmented -S30 on 28s = 1 segment; streaming skips non-final prefills per S27–S30, so ~1). The f32 conversion is 164ms serial, already parallelized into the 94ms decoder load by E2. Making it lazy/on-the-fly therefore *relocates* the same conversion out of (parallel) load into (per-prefill, single-threaded) inference: net ≈ −35ms load, +164ms inference per run = **wall-clock regression**. Wall = load+infer is conserved; only RAM (~1.76GB) improves, which is not the speed gate.
+
+Decision: **Rejected** on the speed criterion. The genuinely beneficial removal of the f32 copies is to make prefill use INT8 weights so the conversion never has to happen at all — that is E11, not a lazy rebuild.
+
+## E4: fused Q/K/V GEMM in encoder ❌
+
+Change: concatenate per-layer wq/wk/wv into one `[3*d_model, d_model]` weight at load, run one BLAS GEMM into `qkv[T, 3*d_model]`, then split each token row into contiguous q/k/v buffers.
+
+| Mode | Wall (E2) | Wall (E4) | Inference (E2→E4) |
+|------|-----------|-----------|-------------------|
+| offline | 859 | 859 | 488 → 489 |
+| segmented | 743 | 742 | 373 → 371 |
+| streaming | 756 | 754 | 384 → 383 |
+
+Decision: **Rejected.** No measurable change (all within noise). Apple Accelerate already schedules the 3 separate QKV GEMMs efficiently on AMX, and the extra split-copy of `qkv[T,3d]` into contiguous q/k/v offsets any fusion benefit. Reverted. (Verified correctness is unaffected: the empty output on the local `short.wav` sample is a pre-existing edge case present on the committed E2 binary too, not introduced here.)
+
+## E5: fused Q/K/V GEMM in decoder prefill ❌
+
+Change: same fusion as E4 applied to the decoder prefill (concat wq/wk/wv f32 prefill weights → one GEMM into `pref_qkv` → split into q/k/v).
+
+| Mode | Wall (E2) | Wall (E5) | Inference |
+|------|-----------|-----------|-----------|
+| offline | 859 | 871 | 489 (=) |
+| segmented | 743 | 753 | 371 (=) |
+| streaming | 756 | 768 | 384 (=) |
+
+Decision: **Rejected.** Inference unchanged (same AMX behavior as E4); wall slightly *worse* because the fused weight is an extra ~470MB copy that lengthens load. Reverted.
+
+## E6: batch conv / reuse im2col across chunks ❌ (unsafe)
+
+The encoder conv front-end processes the mel in ~19 chunks (`enc_chunk_size`≈147), each convolved with its own zero-padding at the chunk edges — this matches the reference model and is baked into the WER. Merging chunks into one full-width conv would change the boundary padding and therefore the output (WER divergence), so it is not a safe speedup. im2col buffers can't be reused across chunks (different data), and parallelizing the chunk loop would oversubscribe the conv internals (im2col is already threaded and the GEMM is Accelerate-threaded).
+
+Decision: **Rejected** — no safe lever that preserves output.
+
+## E7: conv1 single-channel kernel + gelu fusion ❌
+
+conv1 has only 1 input channel, so its im2col+GEMM has K=9 (tiny, latency-bound). But conv1 is a small fraction of total conv FLOPs — conv2/conv3 have c_in=480 (K=4320) and dominate, and they already run on optimal Accelerate BLAS. A naive direct conv1 would be cache-unfriendly and likely slower than the current im2col+AMX path; a competitive hand-vectorized direct-conv kernel is high-effort/high-risk for a sub-1% gain.
+
+Decision: **Rejected** on cost/benefit — conv2/conv3 (the bulk) are already optimal; conv1's ceiling is negligible.
+
+## E8: batched (flash-style) prefill causal attention ✅
+
+Change: the multi-token causal-attention path did two N=1 BLAS calls per (head, query) — for prefill with seq_q≈350 × 16 heads × 28 layers that is a huge number of tiny matvec calls. Replaced with two real GEMMs per head: `S = scale·Q_h·K_hᵀ`, causal-masked row softmax (masked keys zeroed), then `O = S·V_h`. Single-token decode path unchanged.
+
+- `attention_causal` profile: 45.0ms → **24.9ms** (−44%)
+
+| Mode | Wall (E2) | Wall (E8) | Inference (E2→E8) |
+|------|-----------|-----------|-------------------|
+| offline | 859 | **836** | 488 → 468 |
+| segmented | 743 | **731** | 373 → 360 |
+| streaming | 756 | **739** | 384 → 373 |
+
+- 100-file offline WER: **0.0387** (unchanged; CER 0.0164→0.0162)
+- Library tests: pass
+
+Decision: **Accepted.** Halves prefill attention time; ~3-4% inference / ~2-3% wall improvement with zero WER impact. (Computes a few masked-out scores in the upper triangle, but real GEMMs vastly outweigh the eliminated per-call overhead.)
+

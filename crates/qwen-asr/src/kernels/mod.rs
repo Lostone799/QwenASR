@@ -1539,73 +1539,76 @@ fn causal_attention_heads(out: &mut [f32], q: &[f32],
         return;
     }
 
-    // Multi-token path: 3-pass BLAS sgemm
-    let mut scores = vec![0.0f32; seq_k];
+    // Multi-token path: batched per-head GEMMs.
+    // Per head: S[seq_q, seq_k] = scale * Q_h @ K_h^T, then causal-masked
+    // row softmax, then O[seq_q, head_dim] = S @ V_h. This replaces the
+    // 2*seq_q tiny (N=1) BLAS calls per head with two real GEMMs.
+    let mut scores = vec![0.0f32; seq_q * seq_k];
 
     for h in head_start..head_end {
         let kv_h = h / heads_per_kv;
         let k_head = unsafe { k_base.add(kv_h * head_stride) };
         let v_head = unsafe { v_base.add(kv_h * head_stride) };
 
-        for i in 0..seq_q {
-            let q_off = i * q_hidden + h * head_dim;
-            let o_off = i * q_hidden + h * head_dim;
-            let o_row = &mut out[o_off..o_off + head_dim];
-            let global_pos = q_offset + i;
-            let k_end = (global_pos + 1).min(seq_k);
+        // S = scale * Q_h[seq_q, head_dim] @ K_h[seq_k, head_dim]^T.
+        // Q_h rows are strided by q_hidden inside `q`; K_h is contiguous.
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                seq_q as i32, seq_k as i32, head_dim as i32,
+                scale,
+                q.as_ptr().add(h * head_dim), q_hidden as i32,
+                k_head, head_dim as i32,
+                0.0,
+                scores.as_mut_ptr(), seq_k as i32,
+            );
+        }
 
+        // Causal-masked row softmax: query i attends keys 0..=(q_offset+i).
+        for i in 0..seq_q {
+            let k_end = (q_offset + i + 1).min(seq_k);
+            let row = &mut scores[i * seq_k..i * seq_k + seq_k];
             if k_end == 0 {
-                for val in o_row.iter_mut().take(head_dim) { *val = 0.0; }
+                for v in row.iter_mut() { *v = 0.0; }
                 continue;
             }
 
-            // Pass 1: scores = K_h @ q_h
-            unsafe {
-                cblas_sgemm(
-                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
-                    k_end as i32, 1, head_dim as i32,
-                    scale,
-                    k_head, head_dim as i32,
-                    q.as_ptr().add(q_off), 1,
-                    0.0,
-                    scores.as_mut_ptr(), 1,
-                );
-            }
-
-            // Pass 2: Softmax
-            let mut max_s = scores[0];
-            for j in 1..k_end { if scores[j] > max_s { max_s = scores[j]; } }
-            for j in 0..k_end { scores[j] -= max_s; }
+            let mut max_s = row[0];
+            for j in 1..k_end { if row[j] > max_s { max_s = row[j]; } }
+            for j in 0..k_end { row[j] -= max_s; }
 
             #[cfg(all(feature = "vdsp", target_vendor = "apple"))]
             {
                 let n = k_end as i32;
-                unsafe { vvexpf(scores.as_mut_ptr(), scores.as_ptr(), &n); }
+                unsafe { vvexpf(row.as_mut_ptr(), row.as_ptr(), &n); }
             }
             #[cfg(not(all(feature = "vdsp", target_vendor = "apple")))]
             {
-                for j in 0..k_end { scores[j] = scores[j].exp(); }
+                for j in 0..k_end { row[j] = row[j].exp(); }
             }
 
             let mut sum_exp = 0.0f32;
-            for j in 0..k_end { sum_exp += scores[j]; }
+            for j in 0..k_end { sum_exp += row[j]; }
             if sum_exp > 0.0 {
                 let inv = 1.0 / sum_exp;
-                for j in 0..k_end { scores[j] *= inv; }
+                for j in 0..k_end { row[j] *= inv; }
             }
+            // Zero the masked (future) keys so the O = S @ V GEMM ignores them.
+            for j in k_end..seq_k { row[j] = 0.0; }
+        }
 
-            // Pass 3: out = V_h^T @ softmax_scores
-            unsafe {
-                cblas_sgemm(
-                    CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
-                    head_dim as i32, 1, k_end as i32,
-                    1.0,
-                    v_head, head_dim as i32,
-                    scores.as_ptr(), 1,
-                    0.0,
-                    o_row.as_mut_ptr(), 1,
-                );
-            }
+        // O[seq_q, head_dim] = S[seq_q, seq_k] @ V_h[seq_k, head_dim].
+        // O rows are strided by q_hidden inside `out`.
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                seq_q as i32, head_dim as i32, seq_k as i32,
+                1.0,
+                scores.as_ptr(), seq_k as i32,
+                v_head, head_dim as i32,
+                0.0,
+                out.as_mut_ptr().add(h * head_dim), q_hidden as i32,
+            );
         }
     }
 }
