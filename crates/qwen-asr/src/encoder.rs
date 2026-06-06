@@ -153,10 +153,32 @@ fn load_bf16_as_f32(ms: &MultiSafetensors, name: &str) -> Option<Vec<f32>> {
     let n = t.numel();
     let mut f32_data = vec![0.0f32; n];
     let src = unsafe { std::slice::from_raw_parts(bf16_ptr, n) };
-    for i in 0..n {
-        f32_data[i] = f32::from_bits((src[i] as u32) << 16);
-    }
+    kernels::bf16_to_f32_buf(&mut f32_data, src);
     Some(f32_data)
+}
+
+/// Load one encoder transformer layer (bf16->f32 weight conversion). Independent
+/// per layer, so callable in parallel.
+fn load_enc_layer(ms: &MultiSafetensors, i: usize) -> Option<EncLayer> {
+    let lp = format!("{}layers.{}", ENC_PREFIX, i);
+    Some(EncLayer {
+        wq_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
+        wq_bias: load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?,
+        wk_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp))?,
+        wk_bias: load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?,
+        wv_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp))?,
+        wv_bias: load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?,
+        wo_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.out_proj.weight", lp))?,
+        wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
+        attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
+        attn_norm_bias: load_f32(ms, &format!("{}.self_attn_layer_norm.bias", lp))?,
+        fc1_weight: load_bf16_as_f32(ms, &format!("{}.fc1.weight", lp))?,
+        fc1_bias: load_f32(ms, &format!("{}.fc1.bias", lp))?,
+        fc2_weight: load_bf16_as_f32(ms, &format!("{}.fc2.weight", lp))?,
+        fc2_bias: load_f32(ms, &format!("{}.fc2.bias", lp))?,
+        ffn_norm_weight: load_f32(ms, &format!("{}.final_layer_norm.weight", lp))?,
+        ffn_norm_bias: load_f32(ms, &format!("{}.final_layer_norm.bias", lp))?,
+    })
 }
 
 impl Encoder {
@@ -171,30 +193,35 @@ impl Encoder {
         let conv3_bias = load_f32(ms, &format!("{}conv2d3.bias", p))?;
         let conv_out_weight = load_bf16_as_f32(ms, &format!("{}conv_out.weight", p))?;
 
-        let mut layers = Vec::new();
-        for i in 0..cfg.enc_layers {
-            let lp = format!("{}layers.{}", p, i);
-
-            let layer = EncLayer {
-                wq_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
-                wq_bias: load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?,
-                wk_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp))?,
-                wk_bias: load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?,
-                wv_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp))?,
-                wv_bias: load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?,
-                wo_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.out_proj.weight", lp))?,
-                wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
-                attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
-                attn_norm_bias: load_f32(ms, &format!("{}.self_attn_layer_norm.bias", lp))?,
-                fc1_weight: load_bf16_as_f32(ms, &format!("{}.fc1.weight", lp))?,
-                fc1_bias: load_f32(ms, &format!("{}.fc1.bias", lp))?,
-                fc2_weight: load_bf16_as_f32(ms, &format!("{}.fc2.weight", lp))?,
-                fc2_bias: load_f32(ms, &format!("{}.fc2.bias", lp))?,
-                ffn_norm_weight: load_f32(ms, &format!("{}.final_layer_norm.weight", lp))?,
-                ffn_norm_bias: load_f32(ms, &format!("{}.final_layer_norm.bias", lp))?,
-            };
-            layers.push(layer);
-        }
+        // Per-layer weights are independent and conversion-heavy (bf16->f32),
+        // so load encoder layers in parallel.
+        let nlayers = cfg.enc_layers;
+        let nthreads = kernels::get_num_cpus().min(nlayers).max(1);
+        let chunk = nlayers.div_ceil(nthreads);
+        let mut indexed: Vec<(usize, EncLayer)> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..nthreads {
+                let start = t * chunk;
+                let end = ((t + 1) * chunk).min(nlayers);
+                if start >= end {
+                    break;
+                }
+                handles.push(s.spawn(move || {
+                    let mut out = Vec::with_capacity(end - start);
+                    for i in start..end {
+                        out.push((i, load_enc_layer(ms, i)?));
+                    }
+                    Some(out)
+                }));
+            }
+            let mut all: Vec<(usize, EncLayer)> = Vec::with_capacity(nlayers);
+            for h in handles {
+                all.extend(h.join().ok()??);
+            }
+            Some(all)
+        })?;
+        indexed.sort_by_key(|(i, _)| *i);
+        let layers: Vec<EncLayer> = indexed.into_iter().map(|(_, l)| l).collect();
 
         let ln_post_weight = load_f32(ms, &format!("{}ln_post.weight", p))?;
         let ln_post_bias = load_f32(ms, &format!("{}ln_post.bias", p))?;
