@@ -134,3 +134,55 @@ Change: default thread count uses `hw.perflevel0.physicalcpu` (P-cores) instead 
 
 Decision: **Accepted.** Improves every benchmark mode and cuts real-world decode latency ~25%, with WER within the gate. (Note: a finer-grained attempt to cap *only* the decode matvecs to 4 threads while keeping the encoder at full width required thread-pool surgery that introduced a race; the global perf-core default is the safe form and captures essentially the same benefit since the encoder also prefers P-cores post-E8.)
 
+## E11: INT8 GEMM for decoder prefill ❌
+
+Idea: replace the f32 prefill GEMMs (Accelerate sgemm) with an INT8 GEMM reusing the already-quantized weights, eliminating the f32 prefill copies (load + 1.76GB RAM).
+
+Analysis: prefill is compute-bound and runs on Apple's AMX coprocessor via Accelerate f32 sgemm (~2 TFLOP/s). A hand-written CPU/NEON INT8 GEMM cannot access AMX's INT8 path through `cblas` and will not beat AMX f32 for these sizes; a per-token looped INT8 matvec would be far worse (tens of thousands of tiny dispatches per prefill). The only upside is load/RAM, which E2 already parallelized. Net compute would regress.
+
+Decision: **Rejected** — CPU INT8 GEMM cannot beat AMX f32 here; load benefit is secondary and already addressed.
+
+## E12: INT4 decoder weights ❌ (WER)
+
+Decode is bandwidth-bound (reads ~500MB of INT8 weights per token), so INT4 would cut decode bandwidth ~2x. Probed the WER impact cheaply by coarsening the INT8 decode weights to INT4 precision (15 levels, per-row symmetric) while keeping the existing kernel:
+
+- output visibly degraded; 100-file **macro WER 0.2514, CER 0.1735** (gate 0.04)
+
+Decision: **Rejected.** Naive per-row symmetric INT4 destroys accuracy (~6x over the WER gate). Only group-wise GPTQ/AWQ-style INT4 could preserve quality — a research-grade effort, not a kernel tweak. The cheap probe avoided building the full NEON INT4 kernel for a change that fails the gate.
+
+## E13: speculative decoding ❌ (infeasible)
+
+Speculative decoding needs a separate small draft model to propose tokens for the main model to verify in parallel. No draft model exists for Qwen3-ASR, and self-speculative / n-gram (prompt-lookup) variants rely on repetitive output that ASR transcripts don't have. Not implementable in this codebase without training/shipping a draft model.
+
+Decision: **Deferred** — no draft model available; out of scope for a local kernel/threading optimization pass.
+
+---
+
+## Summary
+
+| Exp | Change | Result |
+|-----|--------|--------|
+| E2 | Parallelize model load conversions | ✅ wall −20-23%, WER 0.0387 |
+| E8 | Batched-GEMM prefill causal attention | ✅ attn_causal −44%, infer −3-4%, WER 0.0387 |
+| E1-rev | Default threads = performance cores (post-E8) | ✅ all modes faster, decode −25%, WER 0.0379 |
+| E1 | Threads = P-cores (pre-E8) | ❌ regressed offline (superseded by E1-rev) |
+| E3 | Lazy f32 prefill | ❌ wall-neutral (cost relocated), RAM-only |
+| E4/E5 | Fused Q/K/V GEMM (encoder/prefill) | ❌ no AMX benefit |
+| E6 | Merge conv chunks | ❌ unsafe (changes padding/WER) |
+| E7 | conv1 specialization | ❌ negligible (conv2/3 dominate, already optimal) |
+| E9/E10 | parallel_for backoff / P-core pin | ❌ no isolated-bench benefit |
+| E11 | INT8 prefill GEMM | ❌ can't beat AMX f32 |
+| E12 | INT4 decode weights | ❌ WER 0.25 (naive int4) |
+| E13 | Speculative decoding | ❌ no draft model |
+
+**Net accepted gains (vs baseline `base-e0`):**
+
+| Mode | Wall before | Wall after | Δ |
+|------|-------------|-----------|---|
+| offline | 1071 | ~822 | −23% |
+| segmented | 964 | ~711 | −26% |
+| streaming | 969 | ~722 | −25% |
+| real-clip decode (11.7s) | 381ms | 286ms | −25% |
+
+100-file offline WER: 0.0387 → 0.0379 (within gate). Three commits on branch `perf-round2`.
+
