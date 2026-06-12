@@ -957,3 +957,37 @@ clips, 56% faster cold start, **with slightly better WER**.
 
 ---
 
+## Speed Improvement Experiments — Round 3 (unchecked-ideas.md)
+
+## Speed Improvement Experiments — Round 3
+
+Goal: work through the remaining ideas in `unchecked-ideas.md`, keeping changes that improve speed without pushing the 100-file LibriSpeech offline corpus WER above `0.04`.
+
+Machine: Apple M5 Pro. Model: `qwen3-asr-0.6b`. Speed via `bench/run.sh --runs 10` (median inference = `total_ms`, wall = load+infer). WER via `librispeech_wer.py --limit 100 --mode offline`.
+
+### Baseline (HEAD before Round 3, `baseline-fresh`)
+
+| Mode | Wall (ms) | Inference (ms) |
+|------|-----------|----------------|
+| offline | 1250 | 743 |
+| segmented -S30 | 983 | 503 |
+| streaming | 1024 | 549 |
+
+- 100-file offline WER: **0.0379** (corpus), macro **0.0418**
+- Speed sample WER (28 s, long-audio cap): 0.9189
+
+### E1: Fat LTO + `codegen-units = 1`
+
+Change: `Cargo.toml` release profile switched from `lto = "thin"` to `lto = "fat"` and `codegen-units = 1`.
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 1250 | **880** (−30%) | 743 | **472** (−36%) |
+| segmented | 983 | **767** (−22%) | 503 | **362** (−28%) |
+| streaming | 1024 | **769** (−25%) | 549 | **366** (−33%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+- Build time: ~19 s (vs ~5 s with thin LTO)
+
+Decision: **Accepted.** Much larger speedup than the 3–8% typical for scalar/glue code; likely because the hot kernels and decoder loop benefit heavily from cross-crate inlining and IPO. WER is unchanged. Build is slower but acceptable for release.
+
