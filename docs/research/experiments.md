@@ -1110,6 +1110,22 @@ Change: already present in the codebase (`kernels::linear_nobias_int8_qkv` quant
 
 Decision: **Already implemented.** No separate experiment needed; the single-token path already shares the activation quantization across Q/K/V.
 
+### D3: Superpages for hot weight allocations
+
+Change: allocate the large decoder f32 prefill copies and INT8 quantized weight buffers with `posix_memalign(..., 2 MB, ...)` so the kernel can use 2 MB superpages. Added `superpage_vec()`/`quantize_to_superpage()` helpers in `crates/qwen-asr/src/decoder.rs` and routed all decoder layer weight buffers (Q/K/V/O, gate/up fused, down, lm_head) through them, with fallback to normal `Vec` if alignment fails.
+
+Baseline for this experiment is the accepted A2 build:
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 730 | **711** (−2.6%) | 458 | **442** (−3.5%) |
+| segmented | 612 | **597** (−2.5%) | 340 | **324** (−4.7%) |
+| streaming | 622 | **615** (−1.1%) | 354 | **345** (−2.5%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Accepted.** Small but consistent improvement in all modes; WER unchanged. The change is low-risk and localized to weight loading.
+
 ### Round 3 summary so far
 
 Accepted speed wins (committed):
@@ -1119,6 +1135,7 @@ Accepted speed wins (committed):
 | E1 | Fat LTO + `codegen-units = 1` | −30% to −36% inference, WER unchanged |
 | A5 | `madvise(MADV_WILLNEED)` on mmap | −8% to −11% on top of E1, WER unchanged |
 | A2 | Overlap audio front-end with model load | −9% to −12% wall, WER unchanged |
+| D3 | Superpages for hot weight allocations | −1% to −5% inference/wall, WER unchanged |
 | A6/B5 | Profile breakdown / fused QKV already present | Tooling / no-op |
 
 Rejected:
@@ -1134,9 +1151,9 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 
 | Mode | Inference before | Inference after | Wall before | Wall after |
 |------|-----------------:|----------------:|------------:|-----------:|
-| offline | 743 ms | **458 ms** | 1250 ms | **730 ms** |
-| segmented | 503 ms | **340 ms** | 983 ms | **612 ms** |
-| streaming | 549 ms | **354 ms** | 1024 ms | **622 ms** |
+| offline | 743 ms | **442 ms** | 1250 ms | **711 ms** |
+| segmented | 503 ms | **324 ms** | 983 ms | **597 ms** |
+| streaming | 549 ms | **345 ms** | 1024 ms | **615 ms** |
 
 100-file LibriSpeech offline WER stayed at **0.0379** across all accepted changes.
 
@@ -1146,5 +1163,4 @@ Remaining ideas from `unchecked-ideas.md` not yet tested:
 - **B1**: NEON i8mm (SMMLA) matvec kernels (medium effort)
 - **B10**: Static activation quantization scales (small WER risk)
 - **D1**: Per-phase thread counts (low–medium effort, prior race risk)
-- **D3**: Superpages for hot weight allocations (low–medium effort)
 

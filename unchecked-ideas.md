@@ -129,9 +129,10 @@ Set worker threads to `QOS_CLASS_USER_INTERACTIVE` so the scheduler keeps them o
 *Status: ❌ rejected. Slight regression on idle benchmark (+2–6%); no contention gate in harness.*
 *Impact: small on idle bench; real under contention. Effort: low. Risk: none.*
 
-### D3. Superpages for hot weight allocations
-Allocate the INT8/f32 weight buffers with 2 MB superpages (`VM_FLAGS_SUPERPAGE_SIZE_2MB`) to cut TLB misses during the ~500 MB/token streaming weight reads.
-*Impact: small–medium. Effort: low–medium. Risk: allocation may fail/fragment — needs fallback.*
+### D3. Superpages for hot weight allocations ✅ accepted
+Allocate the INT8/f32 weight buffers with 2 MB superpages (`posix_memalign` to 2 MB, with fallback to normal `Vec`) to cut TLB misses during the ~500 MB/token streaming weight reads.
+*Status: ✅ accepted. −1% to −5% inference/wall across modes; WER unchanged.*
+*Impact: small–medium. Effort: low–medium. Risk: allocation may fail/fragment — fallback handles it.*
 
 ---
 

@@ -4,6 +4,41 @@ use crate::config::*;
 use crate::kernels;
 use crate::safetensors::MultiSafetensors;
 
+const SUPERPAGE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Allocate a zeroed Vec backed by superpage-aligned memory.
+/// On Apple Silicon this makes it possible for the kernel to use 2 MB pages
+/// for the large INT8/f32 weight buffers, reducing TLB pressure during the
+/// ~500 MB/token decode read stream. Falls back to a normal Vec on failure.
+fn superpage_vec<T: Copy>(n: usize) -> Vec<T> {
+    let size = n.checked_mul(std::mem::size_of::<T>()).unwrap_or(0);
+    if size < SUPERPAGE_SIZE {
+        return vec![unsafe { std::mem::zeroed() }; n];
+    }
+    let mut ptr = std::ptr::null_mut();
+    let rc = unsafe { libc::posix_memalign(&mut ptr, SUPERPAGE_SIZE, size) };
+    if rc != 0 || ptr.is_null() {
+        return vec![unsafe { std::mem::zeroed() }; n];
+    }
+    unsafe {
+        std::ptr::write_bytes(ptr, 0, size);
+        Vec::from_raw_parts(ptr as *mut T, n, n)
+    }
+}
+
+/// Quantize a BF16 weight matrix into INT8 and store the (large) INT8 buffer
+/// in superpage-aligned memory.
+fn quantize_to_superpage(
+    w_bf16: *const u16,
+    out_dim: usize,
+    in_dim: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let (int8, scales) = kernels::quantize_bf16_weights_to_int8(w_bf16, out_dim, in_dim);
+    let mut sp = superpage_vec::<i8>(int8.len());
+    sp.copy_from_slice(&int8);
+    (sp, scales)
+}
+
 pub struct DecLayer {
     pub wq_weight_bf16: *const u16,
     pub wk_weight_bf16: *const u16,
@@ -72,20 +107,13 @@ fn load_bf16_direct(ms: &MultiSafetensors, name: &str) -> Option<*const u16> {
     result
 }
 
-fn load_bf16_as_f32(
-    ms: &MultiSafetensors,
-    name: &str,
-    rows: usize,
-    cols: usize,
-) -> Option<Vec<f32>> {
+fn load_bf16_as_f32_into(ms: &MultiSafetensors, name: &str, out: &mut [f32]) -> Option<()> {
     let ptr = load_bf16_direct(ms, name)?;
-    let n = rows * cols;
-    let mut out = vec![0.0f32; n];
     unsafe {
-        let src = std::slice::from_raw_parts(ptr, n);
-        kernels::bf16_to_f32_buf(&mut out, src);
+        let src = std::slice::from_raw_parts(ptr, out.len());
+        kernels::bf16_to_f32_buf(out, src);
     }
-    Some(out)
+    Some(())
 }
 
 /// Load and preprocess a single decoder layer's weights (bf16->f32 prefill copies
@@ -102,14 +130,26 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
     let hidden = cfg.dec_hidden;
     let inter = cfg.dec_intermediate;
 
-    let wq_weight_f32_prefill =
-        load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp), q_dim, hidden)?;
-    let wk_weight_f32_prefill =
-        load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp), kv_dim, hidden)?;
-    let wv_weight_f32_prefill =
-        load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp), kv_dim, hidden)?;
-    let wo_weight_f32_prefill =
-        load_bf16_as_f32(ms, &format!("{}.self_attn.o_proj.weight", lp), hidden, q_dim)?;
+    let wq_weight_f32_prefill = {
+        let mut v = superpage_vec::<f32>(q_dim * hidden);
+        load_bf16_as_f32_into(ms, &format!("{}.self_attn.q_proj.weight", lp), &mut v)?;
+        v
+    };
+    let wk_weight_f32_prefill = {
+        let mut v = superpage_vec::<f32>(kv_dim * hidden);
+        load_bf16_as_f32_into(ms, &format!("{}.self_attn.k_proj.weight", lp), &mut v)?;
+        v
+    };
+    let wv_weight_f32_prefill = {
+        let mut v = superpage_vec::<f32>(kv_dim * hidden);
+        load_bf16_as_f32_into(ms, &format!("{}.self_attn.v_proj.weight", lp), &mut v)?;
+        v
+    };
+    let wo_weight_f32_prefill = {
+        let mut v = superpage_vec::<f32>(hidden * q_dim);
+        load_bf16_as_f32_into(ms, &format!("{}.self_attn.o_proj.weight", lp), &mut v)?;
+        v
+    };
 
     let q_norm = load_f32(ms, &format!("{}.self_attn.q_norm.weight", lp))?;
     let k_norm = load_f32(ms, &format!("{}.self_attn.k_norm.weight", lp))?;
@@ -132,20 +172,22 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
                 .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
         }
     }
-    let mut gate_up_fused_f32_prefill = vec![0.0f32; 2 * inter * hidden];
+    let mut gate_up_fused_f32_prefill = superpage_vec::<f32>(2 * inter * hidden);
     kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
-    let down_weight_f32_prefill =
-        load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
+    let down_weight_f32_prefill = {
+        let mut v = superpage_vec::<f32>(hidden * inter);
+        load_bf16_as_f32_into(ms, &format!("{}.mlp.down_proj.weight", lp), &mut v)?;
+        v
+    };
 
-    // INT8 quantize all decoder layer weights
-    let (wq_int8, wq_int8_scales) = kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden);
-    let (wk_int8, wk_int8_scales) = kernels::quantize_bf16_weights_to_int8(wk, kv_dim, hidden);
-    let (wv_int8, wv_int8_scales) = kernels::quantize_bf16_weights_to_int8(wv, kv_dim, hidden);
-    let (wo_int8, wo_int8_scales) = kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
+    // INT8 quantize all decoder layer weights into superpage-aligned buffers
+    let (wq_int8, wq_int8_scales) = quantize_to_superpage(wq, q_dim, hidden);
+    let (wk_int8, wk_int8_scales) = quantize_to_superpage(wk, kv_dim, hidden);
+    let (wv_int8, wv_int8_scales) = quantize_to_superpage(wv, kv_dim, hidden);
+    let (wo_int8, wo_int8_scales) = quantize_to_superpage(wo, hidden, q_dim);
     let (gate_up_int8, gate_up_int8_scales) =
-        kernels::quantize_bf16_weights_to_int8(gate_up_fused.as_ptr(), 2 * inter, hidden);
-    let (down_int8, down_int8_scales) =
-        kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
+        quantize_to_superpage(gate_up_fused.as_ptr(), 2 * inter, hidden);
+    let (down_int8, down_int8_scales) = quantize_to_superpage(down_bf16, hidden, inter);
 
     Some(DecLayer {
         wq_weight_bf16: wq,
@@ -230,8 +272,7 @@ impl Decoder {
         let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16);
         let lm_out_dim = cfg.lm_head_dim();
         let lm_in_dim = cfg.dec_hidden;
-        let (lm_int8, lm_scales) =
-            kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim);
+        let (lm_int8, lm_scales) = quantize_to_superpage(lm_weight, lm_out_dim, lm_in_dim);
 
         Some(Decoder {
             tok_embeddings_bf16,
