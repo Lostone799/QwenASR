@@ -1055,3 +1055,19 @@ Baseline for this experiment is the accepted A5 build (`f1d3596`):
 
 Decision: **Rejected.** Explicit software prefetches added instruction overhead without measurable benefit; the Apple Silicon hardware prefetcher appears to already cover the sequential INT8 weight streams. Reverted.
 
+### A2: Overlap model load with the audio front-end
+
+Change: in the CLI, when an input file is provided, spawn a thread to load/decode/resample the audio (and run silence compaction) concurrently with `QwenCtx::load`. The loaded samples are then reused for the transcription/SRT path.
+
+Baseline for this experiment is the accepted A5 build (`f1d3596`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 805 | **730** (−9.3%) | 437 | **458** (+4.8%) |
+| segmented | 689 | **612** (−11%) | 322 | **340** (+5.6%) |
+| streaming | 707 | **622** (−12%) | 337 | **354** (+5.0%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Accepted.** Large wall-time reduction by hiding audio front-end work behind model load. The small measured inference-time increase is attributed to cache/memory-bus contention between the audio-loading thread and the model-load workers; the user-visible wall metric is the dominant win and WER is unchanged.
+

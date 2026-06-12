@@ -396,6 +396,18 @@ fn main() {
         );
     }
 
+    // Load audio front-end concurrently with model weights when an input file is
+    // supplied. WAV decode, resample, silence compaction, and mel extraction all
+    // need no weights, so wall time becomes roughly max(load, mel) instead of
+    // load + mel.
+    let audio_handle: Option<std::thread::JoinHandle<Option<Vec<f32>>>> =
+        if !use_stdin && !live_mode && input_wav.is_some() && align_text.is_none() {
+            let path = input_wav.clone().unwrap();
+            Some(std::thread::spawn(move || load_audio(&path)))
+        } else {
+            None
+        };
+
     // Load model
     let mut ctx = match QwenCtx::load(&model_dir) {
         Some(c) => c,
@@ -403,6 +415,19 @@ fn main() {
             eprintln!("Failed to load model from {}", model_dir);
             std::process::exit(1);
         }
+    };
+
+    // Wait for the concurrent audio front-end to finish.
+    let preloaded_samples: Option<Vec<f32>> = if let Some(h) = audio_handle {
+        match h.join() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Error: audio loading thread panicked");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
 
     // Apply settings
@@ -535,11 +560,14 @@ fn main() {
                 eprintln!("Extracting audio from video: {}", input);
             }
         }
-        let samples = match load_audio(input) {
+        let samples = match preloaded_samples {
             Some(s) => s,
-            None => {
-                eprintln!("Failed to load audio from {}", input);
-                std::process::exit(1);
+            None => match load_audio(input) {
+                Some(s) => s,
+                None => {
+                    eprintln!("Failed to load audio from {}", input);
+                    std::process::exit(1);
+                }
             }
         };
         let segments = match transcribe::transcribe_segmented(&mut ctx, &samples) {
@@ -588,7 +616,8 @@ fn main() {
         let samples = if use_stdin {
             audio::read_pcm_stdin()
         } else {
-            load_audio(input_wav.as_ref().unwrap())
+            preloaded_samples
+                .or_else(|| load_audio(input_wav.as_ref().unwrap()))
         };
         match samples {
             Some(s) => transcribe::transcribe_stream(&mut ctx, &s),
@@ -597,14 +626,11 @@ fn main() {
     } else if use_stdin {
         transcribe::transcribe_stdin(&mut ctx)
     } else {
-        let input = input_wav.as_ref().unwrap();
-        if is_video_file(input) {
-            match load_audio(input) {
-                Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
-                None => None,
-            }
-        } else {
-            transcribe::transcribe(&mut ctx, input)
+        let samples = preloaded_samples
+            .or_else(|| load_audio(input_wav.as_ref().unwrap()));
+        match samples {
+            Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
+            None => None,
         }
     };
 

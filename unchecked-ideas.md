@@ -20,6 +20,7 @@ Serialize INT8 weights + scales (and optionally the f32 prefill matrices) to a s
 
 ### A2. Overlap model load with the audio front-end
 WAV decode, resample, silence compaction, and mel extraction need no weights. Run them on a separate thread concurrently with weight loading so wall ≈ max(load, mel) instead of load + mel.
+*Status: ✅ accepted. −9% to −12% wall time; small inference-time increase from contention, WER unchanged. Currently overlaps WAV decode/resample/compaction; mel still inside inference.*
 *Impact: medium. Effort: low–medium. Risk: low.*
 
 ### A3. Tokenizer binary cache / lazy build
