@@ -1110,3 +1110,41 @@ Change: already present in the codebase (`kernels::linear_nobias_int8_qkv` quant
 
 Decision: **Already implemented.** No separate experiment needed; the single-token path already shares the activation quantization across Q/K/V.
 
+### Round 3 summary so far
+
+Accepted speed wins (committed):
+
+| Idea | Change | Impact |
+|------|--------|--------|
+| E1 | Fat LTO + `codegen-units = 1` | −30% to −36% inference, WER unchanged |
+| A5 | `madvise(MADV_WILLNEED)` on mmap | −8% to −11% on top of E1, WER unchanged |
+| A2 | Overlap audio front-end with model load | −9% to −12% wall, WER unchanged |
+| A6/B5 | Profile breakdown / fused QKV already present | Tooling / no-op |
+
+Rejected:
+
+| Idea | Reason |
+|------|--------|
+| D2 | QoS hints regressed on idle benchmark |
+| F1 | Releasing f32 prefill copies regressed wall time |
+| B6 | Software prefetch added overhead |
+| A3 | Lazy tokenizer merge build had mixed/inferior results |
+
+Net vs. Round 3 baseline (`baseline-fresh`):
+
+| Mode | Inference before | Inference after | Wall before | Wall after |
+|------|-----------------:|----------------:|------------:|-----------:|
+| offline | 743 ms | **458 ms** | 1250 ms | **730 ms** |
+| segmented | 503 ms | **340 ms** | 983 ms | **612 ms** |
+| streaming | 549 ms | **354 ms** | 1024 ms | **622 ms** |
+
+100-file LibriSpeech offline WER stayed at **0.0379** across all accepted changes.
+
+Remaining ideas from `unchecked-ideas.md` not yet tested:
+
+- **A1**: Pre-quantized weight cache on disk (high impact, medium effort)
+- **B1**: NEON i8mm (SMMLA) matvec kernels (medium effort)
+- **B10**: Static activation quantization scales (small WER risk)
+- **D1**: Per-phase thread counts (low–medium effort, prior race risk)
+- **D3**: Superpages for hot weight allocations (low–medium effort)
+
