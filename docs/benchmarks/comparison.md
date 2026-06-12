@@ -31,15 +31,25 @@ Output: `bench/compare-results/<timestamp>/` with `report.md`, `summary.json`, c
 
 ## Current qwen-asr HEAD
 
-> Generated on: 2026-06-12
-> Commit: `9ecde04`
+> Generated on: 2026-06-13
+> Commit: `51d7726`
 > Runs: 10
+
+| Mode | Median inference ms | Mean ms | Best ms | Realtime factor |
+|---|---:|---:|---:|---:|
+| offline | 437 | 441.5 | 434 | 64.53× |
+| segmented | 324 | 324.5 | 320 | 87.04× |
+| streaming | 336 | 336.3 | 332 | 83.93× |
+
+Previous dedicated qwen-asr HEAD (`9ecde04`, recorded at `cd65501`):
 
 | Mode | Median inference ms | Mean ms | Best ms | Realtime factor |
 |---|---:|---:|---:|---:|
 | offline | 447 | 460.7 | 444 | 63.09× |
 | segmented | 336 | 337.0 | 333 | 83.93× |
 | streaming | 345 | 344.5 | 342 | 81.74× |
+
+Changes vs `cd65501`/`9ecde04`: −10 ms (−2.2%) offline, −12 ms (−3.6%) segmented, −9 ms (−2.6%) streaming inference; 100-file LibriSpeech offline WER unchanged at **0.0379**.
 
 See [`results.md`](./results.md) for the full speed-benchmark page.
 
