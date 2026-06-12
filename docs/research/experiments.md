@@ -1126,6 +1126,22 @@ Baseline for this experiment is the accepted A2 build:
 
 Decision: **Accepted.** Small but consistent improvement in all modes; WER unchanged. The change is low-risk and localized to weight loading.
 
+### B1: NEON i8mm (SMMLA) matvec kernels
+
+Change: added runtime-detected I8MM SMMLA variants of `matvec_int8` and `argmax_int8_range` in `crates/qwen-asr/src/kernels/neon.rs`. The SMMLA kernel computes two rows per pass by loading 8 bytes of `x`, broadcasting to a 16-byte B matrix, interleaving 8 bytes of `w0` and `w1` into a 16-byte A matrix, and accumulating with `smmla`. Per-row results are recovered by horizontally adding the duplicate lanes and multiplying by 0.5.
+
+Baseline for this experiment is the accepted D3 build:
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 711 | **731** (+2.8%) | 442 | **467** (+5.7%) |
+| segmented | 597 | **617** (+3.4%) | 324 | **354** (+9.3%) |
+| streaming | 615 | **625** (+1.6%) | 345 | **360** (+4.3%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Rejected.** The SMMLA version regressed across all modes. The likely reasons: (1) each useful dot product still requires the same memory bandwidth as SDOT, (2) constructing the interleaved `w_pair` and broadcast `x_bcast` adds load/shuffle overhead versus the existing 16-byte SDOT loads, and (3) the current SDOT implementation is already well-unrolled and latency-hidden. The idea was reverted.
+
 ### Round 3 summary so far
 
 Accepted speed wins (committed):
@@ -1146,6 +1162,7 @@ Rejected:
 | F1 | Releasing f32 prefill copies regressed wall time |
 | B6 | Software prefetch added overhead |
 | A3 | Lazy tokenizer merge build had mixed/inferior results |
+| B1 | I8MM SMMLA matvec regressed vs optimized SDOT |
 
 Net vs. Round 3 baseline (`baseline-fresh`):
 
@@ -1160,7 +1177,6 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 Remaining ideas from `unchecked-ideas.md` not yet tested:
 
 - **A1**: Pre-quantized weight cache on disk (high impact, medium effort)
-- **B1**: NEON i8mm (SMMLA) matvec kernels (medium effort)
 - **B10**: Static activation quantization scales (small WER risk)
 - **D1**: Per-phase thread counts (low–medium effort, prior race risk)
 

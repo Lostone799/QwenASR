@@ -46,8 +46,9 @@ Not an optimization itself: add a startup-phase breakdown (mmap, convert, quanti
 
 ## B. Decode (bandwidth-bound; dominates real uncapped clips)
 
-### B1. NEON i8mm (SMMLA) matvec kernels
-Current kernels use SDOT. On cores with i8mm, SMMLA computes an 8×8 int8 block per instruction (~2× dot throughput) when processing ≥2 rows per pass — pairs naturally with the existing two-rows-per-pass argmax kernel.
+### B1. NEON i8mm (SMMLA) matvec kernels ❌ rejected
+Current kernels use SDOT. On cores with i8mm, SMMLA computes a 2×2×4 int8 block per instruction. A runtime-detected SMMLA variant was implemented for `matvec_int8` and `argmax_int8_range` (interleaving two rows of W and broadcasting x into the B matrix).
+*Status: ❌ rejected. Regressed −5% to −9% inference across modes vs the existing well-unrolled SDOT kernels. Memory bandwidth is the bottleneck; the extra load/shuffle overhead to form SMMLA inputs outweighs any instruction-throughput advantage on this workload.*
 *Impact: medium (compute side of matvec; bandwidth still caps it). Effort: medium. Risk: low.*
 
 ### B2. Group-wise INT4 (GPTQ/AWQ-style)
