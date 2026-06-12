@@ -1229,6 +1229,19 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 
 100-file LibriSpeech offline WER stayed at **0.0379** across all accepted changes.
 
+### Final validation
+
+After all Round 3 experiments were checked and rejected ideas reverted, the branch was rebuilt and benchmarked end-to-end (`final-accepted-state`, 10 runs):
+
+| Mode | Inference | Wall | WER (speed sample) |
+|------|----------:|-----:|-------------------:|
+| offline | 437 ms | 696 ms | 0.9189 (cap sample) |
+| segmented | 324 ms | 583 ms | 0.9189 (cap sample) |
+| streaming | 336 ms | 595 ms | 0.9189 (cap sample) |
+
+- 100-file LibriSpeech offline WER: **0.0379** (≤ 0.04 gate ✅)
+- Working tree is clean; all rejected ideas are fully reverted.
+
 Remaining ideas from `unchecked-ideas.md` not yet tested:
 
 *All Round 3 ideas have now been checked.*
