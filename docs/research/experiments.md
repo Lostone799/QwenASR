@@ -991,3 +991,19 @@ Change: `Cargo.toml` release profile switched from `lto = "thin"` to `lto = "fat
 
 Decision: **Accepted.** Much larger speedup than the 3–8% typical for scalar/glue code; likely because the hot kernels and decoder loop benefit heavily from cross-crate inlining and IPO. WER is unchanged. Build is slower but acceptable for release.
 
+### A5: Page-fault prefaulting of mmap'd model weights
+
+Change: after `mmap()` of each safetensors shard, call `madvise(..., MADV_WILLNEED)` on the whole mapping so the kernel prefaults pages asynchronously before the weight-conversion loops touch them.
+
+Baseline for this experiment is the accepted E1 build (`d4da5ae`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 880 | **805** (−8.5%) | 472 | **437** (−7.4%) |
+| segmented | 767 | **689** (−10%) | 362 | **322** (−11%) |
+| streaming | 769 | **707** (−8.1%) | 366 | **337** (−7.9%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Accepted.** Cheap, zero-risk win on wall-clock and inference time; WER unchanged.
+

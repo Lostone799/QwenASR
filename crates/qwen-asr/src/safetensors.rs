@@ -111,6 +111,13 @@ impl SafetensorsFile {
         }
         let data = data as *mut u8;
 
+        // Prefault the mmap so first-touch page faults don't serialize inside
+        // the weight-conversion loops. MADV_WILLNEED is asynchronous and safe
+        // to ignore on failure.
+        unsafe {
+            libc::madvise(data as *mut _, file_size, libc::MADV_WILLNEED);
+        }
+
         // Read header size (first 8 bytes, little-endian u64)
         let header_size = unsafe {
             let mut buf = [0u8; 8];
