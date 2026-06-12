@@ -25,6 +25,7 @@ WAV decode, resample, silence compaction, and mel extraction need no weights. Ru
 
 ### A3. Tokenizer binary cache / lazy build
 If vocab.json parse + trie construction is a measurable slice of the ~370 ms floor, cache the parsed tokenizer in a binary format, or defer building it until the first decoded token.
+*Status: ❌ rejected. Lazy merge-map build gave mixed wall results and inference regressions; binary cache not pursued.*
 *Impact: small–medium (measure first). Effort: low. Risk: low.*
 
 ### A4. Daemon / server mode

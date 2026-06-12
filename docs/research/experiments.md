@@ -1071,3 +1071,19 @@ Baseline for this experiment is the accepted A5 build (`f1d3596`):
 
 Decision: **Accepted.** Large wall-time reduction by hiding audio front-end work behind model load. The small measured inference-time increase is attributed to cache/memory-bus contention between the audio-loading thread and the model-load workers; the user-visible wall metric is the dominant win and WER is unchanged.
 
+### A3: Tokenizer binary cache / lazy build
+
+Change: deferred parsing of `merges.txt` and construction of the BPE `merge_map` until the first call to `encode()`. This required changing `encode()` and `prepare_prompt_tokens()` to take `&mut QwenTokenizer` and propagating `&mut` through all tokenizer call sites.
+
+Baseline for this experiment is the accepted A2 build (`b219874`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 730 | **718** (−1.6%) | 458 | **474** (+3.5%) |
+| segmented | 612 | **590** (−3.6%) | 340 | **349** (+2.6%) |
+| streaming | 622 | **630** (+1.3%) | 354 | **384** (+8.5%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Rejected.** Results are mixed and the inference-time regressions outweigh the small wall-time improvements. The `&mut` signature propagation is also invasive for a marginal gain. Reverted.
+
