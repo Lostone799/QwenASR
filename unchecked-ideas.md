@@ -155,6 +155,7 @@ Export the encoder to a Core ML model to run on the idle Neural Engine while Rus
 
 ### F1. Release f32 prefill copies after last prefill
 Offline mode performs exactly one prefill; `madvise(MADV_FREE)`/drop the 1.76 GB f32 copies afterwards. Peak RSS 5.1 → ~3.3 GB. No bench speedup on a 32 GB machine, but avoids swap-driven slowdowns on 8–16 GB targets (and matters for the mobile/JNI builds).
+*Status: ❌ rejected on speed gate. Slight wall-time regression (+2–5%) from deallocation on benchmark machine; no WER impact.*
 *Impact: none on bench; real on small RAM. Effort: low. Risk: none.*
 
 ### F2. Skip building unused weight copies per mode

@@ -1023,3 +1023,19 @@ Baseline for this experiment is the accepted A5 build (`f1d3596`):
 
 Decision: **Rejected.** On an otherwise-idle benchmark machine the QoS call adds a small overhead and does not improve latency. The idea notes the benefit appears under system contention, which is not the measured gate. Reverted.
 
+### F1: Release f32 prefill weight copies after last prefill
+
+Change: added `Decoder::release_prefill_weights()` to clear the 1.76 GB of f32 prefill copies, and called it at the end of `transcribe_audio`.
+
+Baseline for this experiment is the accepted A5 build (`f1d3596`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 805 | **826** (+2.6%) | 437 | **449** (+2.7%) |
+| segmented | 689 | **717** (+4.1%) | 322 | **337** (+4.7%) |
+| streaming | 707 | **720** (+1.8%) | 337 | **341** (+1.2%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Rejected.** On the 32 GB+ benchmark machine the freed memory does not speed inference, and the extra deallocation work slightly regresses wall time. Fully reverted.
+
