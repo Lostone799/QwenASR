@@ -88,6 +88,8 @@ impl QwenCtx {
             eprintln!("Loading model from {}", model_dir);
         }
 
+        let _pg = kernels::ProfileGuard::new(&kernels::PROF.model_load);
+        let load_t0 = std::time::Instant::now();
         let ms = MultiSafetensors::open(model_dir)?;
 
         // Detect model variant from tensor shapes
@@ -115,19 +117,25 @@ impl QwenCtx {
         if kernels::verbose() >= 1 {
             eprintln!("Loading encoder weights...");
         }
-        let encoder = Encoder::load(&ms, &cfg)?;
+        let encoder = {
+            let _pg = kernels::ProfileGuard::new(&kernels::PROF.encoder_load);
+            Encoder::load(&ms, &cfg)?
+        };
 
         // Load decoder
         if kernels::verbose() >= 1 {
             eprintln!("Loading decoder weights...");
         }
-        let decoder = Decoder::load(&ms, &cfg)?;
+        let decoder = {
+            let _pg = kernels::ProfileGuard::new(&kernels::PROF.decoder_load);
+            Decoder::load(&ms, &cfg)?
+        };
 
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
         let dec_bufs = DecoderBuffers::new(&cfg);
 
         if kernels::verbose() >= 1 {
-            eprintln!("Model loaded.");
+            eprintln!("Model loaded in {:.0} ms", load_t0.elapsed().as_secs_f64() * 1000.0);
         }
 
         Some(QwenCtx {

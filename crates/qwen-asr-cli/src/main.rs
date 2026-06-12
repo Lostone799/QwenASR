@@ -403,7 +403,10 @@ fn main() {
     let audio_handle: Option<std::thread::JoinHandle<Option<Vec<f32>>>> =
         if !use_stdin && !live_mode && input_wav.is_some() && align_text.is_none() {
             let path = input_wav.clone().unwrap();
-            Some(std::thread::spawn(move || load_audio(&path)))
+            Some(std::thread::spawn(move || {
+                let _pg = qwen_asr::kernels::ProfileGuard::new(&qwen_asr::kernels::PROF.audio_load);
+                load_audio(&path)
+            }))
         } else {
             None
         };

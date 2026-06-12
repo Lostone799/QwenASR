@@ -132,7 +132,8 @@ macro_rules! define_profile_counters {
 define_profile_counters!(
     rms_norm, layer_norm, gelu, swiglu,
     bf16_matvec, bf16_to_f32_conv, attention_bidir, attention_causal,
-    sgemm, conv2d_op, rope, add_inplace_op
+    sgemm, conv2d_op, rope, add_inplace_op,
+    model_load, encoder_load, decoder_load, tokenizer_load, audio_load, mel_compute
 );
 
 pub static PROF: ProfileCounters = ProfileCounters::new();

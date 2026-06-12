@@ -39,6 +39,7 @@ If vocab.json parse + trie construction is a measurable slice of the ~370 ms flo
 
 ### A6. Per-phase wall breakdown in bench
 Not an optimization itself: add a startup-phase breakdown (mmap, convert, quantize, tokenizer, mel) to `--profile` so A1–A5 can be sized and tracked for regressions.
+*Status: ✅ accepted as tooling. Added model/encoder/decoder/tokenizer/audio/mel profile counters; no speed impact.*
 *Impact: enabler. Effort: low.*
 
 ---

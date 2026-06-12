@@ -1087,3 +1087,20 @@ Baseline for this experiment is the accepted A2 build (`b219874`):
 
 Decision: **Rejected.** Results are mixed and the inference-time regressions outweigh the small wall-time improvements. The `&mut` signature propagation is also invasive for a marginal gain. Reverted.
 
+### A6: Per-phase wall breakdown in `--profile`
+
+Change: added new profile counters (`model_load`, `encoder_load`, `decoder_load`, `tokenizer_load`, `audio_load`, `mel_compute`) and instrumented the load, audio, and mel paths so `--profile` prints a startup-phase breakdown.
+
+Example breakdown for the 28 s speed sample (offline, after accepted A2):
+
+| Phase | Time |
+|-------|-----:|
+| model_load | 249 ms |
+| encoder_load | 16 ms |
+| decoder_load | 72 ms |
+| tokenizer_load | 40 ms |
+| audio_load | 176 ms (overlapped with model load) |
+| mel_compute | 455 ms |
+
+Decision: **Accepted as tooling.** No speed change; purely diagnostic. Committed because it enables sizing future load/overlap ideas.
+
