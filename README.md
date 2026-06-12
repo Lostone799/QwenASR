@@ -18,9 +18,10 @@ On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **470 ms** �
 | pure C upstream | 1,610 ms | 17.50× |
 | qwen-asr (first Rust port) | 1,612 ms | 17.49× |
 
-![Latency comparison](docs/benchmarks/charts/benchmark-unified-latency.png)
-
-![Realtime factor comparison](docs/benchmarks/charts/benchmark-unified-rtf.png)
+<p float="left">
+  <img src="docs/benchmarks/charts/benchmark-unified-latency.png" width="48%" alt="Latency comparison" />
+  <img src="docs/benchmarks/charts/benchmark-unified-rtf.png" width="48%" alt="Realtime factor comparison" />
+</p>
 
 > Benchmarked on the same 28.2 s sample with 10 runs each. Latest qwen-asr uses all 15 CPU cores; the dedicated speed benchmark on performance cores reaches **447 ms / 63.09×**. See [`docs/benchmarks/comparison.md`](docs/benchmarks/comparison.md) for full details and reproduction steps.
 

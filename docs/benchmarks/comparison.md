@@ -71,9 +71,10 @@ See [`results.md`](./results.md) for the full speed-benchmark page.
 | pure C upstream | `b00b789` | 1,875 | 1,879 | 1,866 | 15.02× |
 | qwen-asr (first) | `bf52daf` | 1,952 | 1,991 | 1,935 | 14.45× |
 
-![Unified latency](charts/benchmark-unified-latency.png)
-
-![Unified realtime factor](charts/benchmark-unified-rtf.png)
+<p float="left">
+  <img src="charts/benchmark-unified-latency.png" width="48%" alt="Unified latency" />
+  <img src="charts/benchmark-unified-rtf.png" width="48%" alt="Unified realtime factor" />
+</p>
 
 ### Findings
 
