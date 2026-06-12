@@ -1176,6 +1176,24 @@ Results vs accepted D3 build:
 
 Decision: **Rejected.** Results are mixed and within run-to-run noise: 4 workers helps segmented slightly but not streaming; 5 workers helps streaming but hurts offline. No clear all-mode win to justify the added dispatch complexity. Fully reverted.
 
+### A1: Pre-quantized weight cache on disk
+
+Change: implemented a custom binary cache (`crates/qwen-asr/src/weight_cache.rs`) that stores the converted/quantized weight tensors for encoder and decoder after the first load. On subsequent runs the cache is read and bf16→f32 conversion + INT8 quantization is skipped. Cache files are keyed by source safetensors file names/sizes/mtimes so model changes invalidate the cache.
+
+Results vs accepted D3 build:
+
+| Mode | Inference before | Inference after | Wall before | Wall after |
+|------|-----------------:|----------------:|------------:|-----------:|
+| offline | 442 ms | 445 ms | 711 ms | **957 ms** (+35%) |
+| segmented | 324 ms | 337 ms | 597 ms | **850 ms** (+42%) |
+| streaming | 345 ms | 346 ms | 615 ms | **860 ms** (+40%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+- Cache size: encoder ~711 MB, decoder ~2.5 GB
+- Targeted model-load measurement: warm-cache load ~437 ms vs baseline model load ~249 ms
+
+Decision: **Rejected.** Although WER is unchanged, the cache is slower than the existing mmap + on-demand conversion path because the current implementation reads the full 3.2 GB cache into owned `Vec`s instead of memory-mapping it. The original safetensors model is only ~1.2 GB and is already mmaped with `MADV_WILLNEED`, so copying 3.2 GB from the cache file is a net regression. A mmap-based cache could reverse this, but that would require the weight structs to own either a `Vec` or a mmap slice and is left as future work. Fully reverted.
+
 ### Round 3 summary so far
 
 Accepted speed wins (committed):
@@ -1199,6 +1217,7 @@ Rejected:
 | B1 | I8MM SMMLA matvec regressed vs optimized SDOT |
 | B10 | Static activation scales clipped or lost precision |
 | D1 | Decode thread cap gave mixed/noisy results |
+| A1 | On-disk weight cache slower than mmap + conversion |
 
 Net vs. Round 3 baseline (`baseline-fresh`):
 
@@ -1212,5 +1231,5 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 
 Remaining ideas from `unchecked-ideas.md` not yet tested:
 
-- **A1**: Pre-quantized weight cache on disk (high impact, medium effort)
+*All Round 3 ideas have now been checked.*
 

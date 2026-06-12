@@ -14,10 +14,10 @@ Gate for all ideas: 100-file LibriSpeech offline WER ≤ 0.04.
 
 ## A. Startup / wall-clock (~370 ms fixed floor)
 
-### A1. Pre-quantized weight cache on disk
+### A1. Pre-quantized weight cache on disk ❌ rejected
 Serialize INT8 weights + scales (and optionally the f32 prefill matrices) to a sidecar file on first run; mmap it directly afterwards. Removes the per-run bf16→f32/INT8 conversion entirely instead of parallelizing it (E2) or relocating it (rejected E3). Could also let `download.rs` fetch pre-quantized artifacts.
+*Status: ❌ rejected. A custom binary cache was implemented. WER was unchanged (0.0379), but wall time regressed +35% to +42% across modes because the cache was read into owned `Vec`s instead of being memory-mapped. A mmap-based cache might reverse this, but the current implementation is slower than the existing ~1.2 GB safetensors mmap + on-demand conversion.*
 *Impact: high (most of remaining load). Effort: medium. Risk: low (bit-identical weights).*
-
 ### A2. Overlap model load with the audio front-end
 WAV decode, resample, silence compaction, and mel extraction need no weights. Run them on a separate thread concurrently with weight loading so wall ≈ max(load, mel) instead of load + mel.
 *Status: ✅ accepted. −9% to −12% wall time; small inference-time increase from contention, WER unchanged. Currently overlaps WAV decode/resample/compaction; mel still inside inference.*
