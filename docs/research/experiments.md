@@ -1007,3 +1007,19 @@ Baseline for this experiment is the accepted E1 build (`d4da5ae`):
 
 Decision: **Accepted.** Cheap, zero-risk win on wall-clock and inference time; WER unchanged.
 
+### D2: macOS QoS hints for worker threads
+
+Change: at the start of each thread-pool worker, call `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)` so workers prefer P-cores when the system is under contention.
+
+Baseline for this experiment is the accepted A5 build (`f1d3596`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 805 | **828** (+2.9%) | 437 | **454** (+3.9%) |
+| segmented | 689 | **718** (+4.2%) | 322 | **341** (+5.9%) |
+| streaming | 707 | **723** (+2.3%) | 337 | **348** (+3.3%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Rejected.** On an otherwise-idle benchmark machine the QoS call adds a small overhead and does not improve latency. The idea notes the benefit appears under system contention, which is not the measured gate. Reverted.
+

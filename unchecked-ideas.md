@@ -32,6 +32,7 @@ If vocab.json parse + trie construction is a measurable slice of the ~370 ms flo
 
 ### A5. Page-fault prefaulting of the mmap'd model
 `madvise(MADV_WILLNEED)` / parallel page-touch on the 1.87 GB mmap before the conversion pass so first-touch faults don't serialize inside load loops.
+*Status: ✅ accepted. −8% to −11% inference / wall on top of E1, WER unchanged.*
 *Impact: small–medium. Effort: low. Risk: none.*
 
 ### A6. Per-phase wall breakdown in bench
@@ -120,6 +121,7 @@ E1-revisited found decode wants ~4–5 P-cores while pre-E8 encoder liked more t
 
 ### D2. macOS QoS hints instead of pinning
 Set worker threads to `QOS_CLASS_USER_INTERACTIVE` so the scheduler keeps them on P-cores under load (pinning isn't available; E10's approach was rejected on an idle machine, but QoS matters on a busy one).
+*Status: ❌ rejected. Slight regression on idle benchmark (+2–6%); no contention gate in harness.*
 *Impact: small on idle bench; real under contention. Effort: low. Risk: none.*
 
 ### D3. Superpages for hot weight allocations
