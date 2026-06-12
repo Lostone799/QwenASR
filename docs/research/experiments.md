@@ -1142,6 +1142,18 @@ Baseline for this experiment is the accepted D3 build:
 
 Decision: **Rejected.** The SMMLA version regressed across all modes. The likely reasons: (1) each useful dot product still requires the same memory bandwidth as SDOT, (2) constructing the interleaved `w_pair` and broadcast `x_bcast` adds load/shuffle overhead versus the existing 16-byte SDOT loads, and (3) the current SDOT implementation is already well-unrolled and latency-hidden. The idea was reverted.
 
+### B10: Static activation quantization scales
+
+Change: added an optional static scale to `quantize_f32_to_int8` and set it globally in the CLI. A conservative static scale of `10.0 / 127.0` (mapping |x| ≤ 10.0 to the int8 range) was chosen to avoid clipping.
+
+Results on the speed sample:
+- Speed sample WER jumped from 0.9189 to **1.0000** (all tokens wrong / degenerate output)
+- The 100-file offline WER run timed out before completing, indicating the decode loop produced excessive/incorrect tokens
+- Calibration on a single file showed activation max abs up to **421.7**, far above the 10.0 threshold, so the chosen scale caused massive clipping
+- To cover the observed range the static scale would need to be ~421/127, which maps typical x ≈ 1.0 to int8 values near 0 and destroys precision
+
+Decision: **Rejected.** A single global static scale cannot simultaneously cover the wide dynamic range of decoder activations and retain enough int8 precision. Per-layer calibrated scales might be viable but require substantial offline calibration infrastructure and are not justified by the small compute share of activation quantization (≪ weight-read bandwidth). Fully reverted.
+
 ### Round 3 summary so far
 
 Accepted speed wins (committed):
@@ -1163,6 +1175,7 @@ Rejected:
 | B6 | Software prefetch added overhead |
 | A3 | Lazy tokenizer merge build had mixed/inferior results |
 | B1 | I8MM SMMLA matvec regressed vs optimized SDOT |
+| B10 | Static activation scales clipped or lost precision |
 
 Net vs. Round 3 baseline (`baseline-fresh`):
 
@@ -1177,6 +1190,5 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 Remaining ideas from `unchecked-ideas.md` not yet tested:
 
 - **A1**: Pre-quantized weight cache on disk (high impact, medium effort)
-- **B10**: Static activation quantization scales (small WER risk)
 - **D1**: Per-phase thread counts (low–medium effort, prior race risk)
 

@@ -85,9 +85,10 @@ First pass over a coarser representation (e.g., INT4 or even per-row scale bound
 Let argmax shards return early and allow one thread to begin next-token layer-0 work (embedding fetch can be deferred but norms/buffers can be staged). Marginal pipelining of the per-token tail.
 *Impact: small. Effort: medium. Risk: complexity.*
 
-### B10. Static activation quantization scales
+### B10. Static activation quantization scales ❌ rejected
 If the INT8 matvec currently re-quantizes activations dynamically per call, calibrated static scales would skip the quantize pass per token per layer.
-*Impact: small. Effort: low–medium. Risk: small WER risk.*
+*Status: ❌ rejected. A global static scale either clips (observed max_abs up to 421.7 on one file) or, if enlarged to cover the range, maps typical activations to int8 values near 0 and destroys precision. The speed-sample WER jumped to 1.0000 and the 100-file run timed out. Per-layer calibrated scales might work but need substantial offline calibration for a small compute win.*
+*Impact: small. Effort: low–medium. Risk: WER gate exceeded with naive global scale.*
 
 ---
 
