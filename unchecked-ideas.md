@@ -65,6 +65,7 @@ One pass over the input activation feeding three weight streams (one x load inst
 
 ### B6. Software prefetch (`prfm`) in INT8 matvec/argmax inner loops
 Weight streams are perfectly sequential; explicit prefetch ahead of the SDOT loop is sometimes worth 5–10% on bandwidth-bound aarch64 loops.
+*Status: ❌ rejected. Added 3–4% overhead on Apple M5 Pro; hardware prefetcher already covers the sequential streams.*
 *Impact: small–medium. Effort: low. Risk: none.*
 
 ### B7. f16 (or INT8) KV cache

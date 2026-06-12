@@ -1039,3 +1039,19 @@ Baseline for this experiment is the accepted A5 build (`f1d3596`):
 
 Decision: **Rejected.** On the 32 GB+ benchmark machine the freed memory does not speed inference, and the extra deallocation work slightly regresses wall time. Fully reverted.
 
+### B6: Software prefetch (`prfm`) in INT8 matvec/argmax
+
+Change: added `prfm pldl1keep` prefetches one cache line ahead in the sequential weight streams of `matvec_int8` and `argmax_int8_range`.
+
+Baseline for this experiment is the accepted A5 build (`f1d3596`):
+
+| Mode | Wall before | Wall after | Inference before | Inference after |
+|------|-------------|-----------:|------------------|----------------:|
+| offline | 805 | **835** (+3.7%) | 437 | **451** (+3.2%) |
+| segmented | 689 | **715** (+3.8%) | 322 | **336** (+4.3%) |
+| streaming | 707 | **729** (+3.1%) | 337 | **351** (+4.2%) |
+
+- 100-file offline WER: **0.0379** (unchanged)
+
+Decision: **Rejected.** Explicit software prefetches added instruction overhead without measurable benefit; the Apple Silicon hardware prefetcher appears to already cover the sequential INT8 weight streams. Reverted.
+
