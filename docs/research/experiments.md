@@ -1104,3 +1104,9 @@ Example breakdown for the 28 s speed sample (offline, after accepted A2):
 
 Decision: **Accepted as tooling.** No speed change; purely diagnostic. Committed because it enables sizing future load/overlap ideas.
 
+### B5: Fused QKV INT8 matvec (single-token decode)
+
+Change: already present in the codebase (`kernels::linear_nobias_int8_qkv` quantizes the activation once and feeds the same `x_int8`/`x_scale` into the Q, K, and V INT8 matvecs).
+
+Decision: **Already implemented.** No separate experiment needed; the single-token path already shares the activation quantization across Q/K/V.
+

@@ -64,6 +64,7 @@ E13 rejected speculative decoding for lack of a draft model — but streaming re
 
 ### B5. Fused QKV INT8 matvec (single-token path)
 One pass over the input activation feeding three weight streams (one x load instead of three). E4/E5 rejected the *GEMM* fusion on AMX; the NEON single-token matvec path was never tested.
+*Status: ✅ already implemented. `linear_nobias_int8_qkv` shares the quantized activation across Q/K/V matvecs.*
 *Impact: small. Effort: low. Risk: low.*
 
 ### B6. Software prefetch (`prfm`) in INT8 matvec/argmax inner loops
