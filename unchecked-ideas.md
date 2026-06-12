@@ -122,8 +122,9 @@ If encoder attention/FFN GEMMs are issued per window, batching multiple windows 
 
 ## D. Threading / scheduling
 
-### D1. Per-phase thread counts (safe re-do)
+### D1. Per-phase thread counts (safe re-do) ❌ rejected
 E1-revisited found decode wants ~4–5 P-cores while pre-E8 encoder liked more threads; a finer-grained attempt raced and was abandoned. Safe version: `parallel_for` takes an explicit `max_workers` per call site (no pool resize), so decode matvecs cap at 4–5 while encoder-side parallel ops can use more.
+*Status: ❌ rejected. Capping decode INT8 matvecs to 4 or 5 workers gave mixed, noise-level results (small improvements in some modes, small regressions in others). No clear all-mode win.*
 *Impact: small–medium. Effort: low–medium. Risk: low if no pool surgery.*
 
 ### D2. macOS QoS hints instead of pinning

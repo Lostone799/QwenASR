@@ -1154,6 +1154,28 @@ Results on the speed sample:
 
 Decision: **Rejected.** A single global static scale cannot simultaneously cover the wide dynamic range of decoder activations and retain enough int8 precision. Per-layer calibrated scales might be viable but require substantial offline calibration infrastructure and are not justified by the small compute share of activation quantization (≪ weight-read bandwidth). Fully reverted.
 
+### D1: Per-phase thread counts (decode INT8 matvec cap)
+
+Change: added `parallel_for_with_max()` so individual call sites can cap the number of participating workers without resizing the thread pool. Capped the bandwidth-bound single-token decode INT8 matvecs (QKV, O-proj, gate/up, down, lm_head argmax) to 4 and then 5 workers, leaving encoder/prefill ops at the full P-core count.
+
+Results vs accepted D3 build:
+
+| Workers | Mode | Inference (ms) | Wall (ms) |
+|--------:|------|---------------:|----------:|
+| baseline (10 P-cores) | offline | 442 | 711 |
+| 4 | offline | 438 | 711 |
+| 5 | offline | 474 | 761 |
+| baseline | segmented | 324 | 597 |
+| 4 | segmented | 319 | 589 |
+| 5 | segmented | 317 | 594 |
+| baseline | streaming | 345 | 615 |
+| 4 | streaming | 335 | 617 |
+| 5 | streaming | 327 | 603 |
+
+- 100-file offline WER: **0.0379** (unchanged for both caps)
+
+Decision: **Rejected.** Results are mixed and within run-to-run noise: 4 workers helps segmented slightly but not streaming; 5 workers helps streaming but hurts offline. No clear all-mode win to justify the added dispatch complexity. Fully reverted.
+
 ### Round 3 summary so far
 
 Accepted speed wins (committed):
@@ -1176,6 +1198,7 @@ Rejected:
 | A3 | Lazy tokenizer merge build had mixed/inferior results |
 | B1 | I8MM SMMLA matvec regressed vs optimized SDOT |
 | B10 | Static activation scales clipped or lost precision |
+| D1 | Decode thread cap gave mixed/noisy results |
 
 Net vs. Round 3 baseline (`baseline-fresh`):
 
@@ -1190,5 +1213,4 @@ Net vs. Round 3 baseline (`baseline-fresh`):
 Remaining ideas from `unchecked-ideas.md` not yet tested:
 
 - **A1**: Pre-quantized weight cache on disk (high impact, medium effort)
-- **D1**: Per-phase thread counts (low–medium effort, prior race risk)
 
