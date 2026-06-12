@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -74,15 +75,15 @@ def pick_result(items: list[dict], impl: str, accelerate: bool, mode: str = "off
 
 
 def chart_rows_from_summary(items: list[dict], baseline_ref: str, current_ref: str) -> list[dict]:
-    mapping = [
-        ("rust-original", f"qwen-asr first\n{baseline_ref}"),
-        ("rust-current", f"qwen-asr latest\n{current_ref}"),
-        ("c-antirez", "pure C\nupstream"),
-        ("second-state-mlx", "second-state\nMLX GPU"),
-        ("mlx-audio", "mlx-audio\nPython MLX"),
-    ]
+    labels = {
+        "rust-original": f"qwen-asr first\n{baseline_ref}",
+        "rust-current": f"qwen-asr latest\n{current_ref}",
+        "c-antirez": "pure C\nupstream",
+        "second-state-mlx": "second-state\nMLX GPU",
+        "mlx-audio": "mlx-audio\nPython MLX",
+    }
     rows = []
-    for impl, label in mapping:
+    for impl, label in labels.items():
         item = next(
             (
                 candidate
@@ -110,6 +111,8 @@ def chart_rows_from_summary(items: list[dict], baseline_ref: str, current_ref: s
                 "commit": item.get("commit"),
             }
         )
+    # Sort by median inference latency ascending (fastest first) so charts read left-to-right by speed.
+    rows.sort(key=lambda r: r["total_ms"])
     return rows
 
 
@@ -195,12 +198,17 @@ def build_markdown_report(
         if impl not in by_impl:
             raise SystemExit(f"Missing benchmark result for '{impl}'")
 
+    # Build table sorted by median inference latency (fastest first).
+    impl_labels = {
+        "rust-original": ("qwen-asr (first)", baseline_ref),
+        "rust-current": ("qwen-asr (latest)", current_ref),
+        "c-antirez": ("pure C upstream", by_impl["c-antirez"].get("commit") or "-"),
+        "second-state-mlx": ("second-state MLX GPU", by_impl["second-state-mlx"].get("commit") or "-"),
+        "mlx-audio": ("mlx-audio Python MLX", by_impl["mlx-audio"].get("commit") or "-"),
+    }
     table = [
-        ("qwen-asr (first)", baseline_ref, by_impl["rust-original"]),
-        ("qwen-asr (latest)", current_ref, by_impl["rust-current"]),
-        ("pure C upstream", by_impl["c-antirez"].get("commit") or "-", by_impl["c-antirez"]),
-        ("second-state MLX GPU", by_impl["second-state-mlx"].get("commit") or "-", by_impl["second-state-mlx"]),
-        ("mlx-audio Python MLX", by_impl["mlx-audio"].get("commit") or "-", by_impl["mlx-audio"]),
+        (impl_labels[row["impl"]][0], impl_labels[row["impl"]][1], row)
+        for row in rows
     ]
 
     latest_ms = by_impl["rust-current"]["total_ms"]
@@ -229,6 +237,7 @@ def build_markdown_report(
     lines.append("- Wall-clock time is retained as a secondary metric.")
     lines.append(f"- Standalone rounds per target: `{runs}`.")
     lines.append(f"- Modes requested: `{modes}`.")
+    lines.append("- Results in the table and charts are sorted by median inference latency (fastest leftmost).")
     lines.append("")
     lines.append("## Environment")
     lines.append("")
@@ -330,6 +339,12 @@ def main() -> None:
         "Higher is better",
         charts_dir / "benchmark-unified-rtf.png",
     )
+
+    # Keep the docs copy of the charts in sync so comparison.md can use local paths.
+    docs_charts_dir = Path("docs/benchmarks/charts")
+    docs_charts_dir.mkdir(parents=True, exist_ok=True)
+    for chart_name in ("benchmark-unified-latency.png", "benchmark-unified-rtf.png"):
+        shutil.copy2(charts_dir / chart_name, docs_charts_dir / chart_name)
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_content = build_markdown_report(

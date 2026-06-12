@@ -2,69 +2,33 @@
 
 [![OctoCounts](https://api.octocounts.com/badge/huanglizhuo/QwenASR/branch/main)](https://octocounts.com/?q=https%3A%2F%2Fgithub.com%2Fhuanglizhuo%2FQwenASR&ref=main)
 
-A **blazing fast**, pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. It features zero heavy runtime dependencies (only `libc`) and is ported from [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
+A **blazing fast**, pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. Zero heavy runtime dependencies (only `libc`). Ported from [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
 
-Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming, live capture, VAD live, and forced alignment.
+Supports 0.6B and 1.7B models with offline, segmented, streaming, live capture, VAD live, and forced alignment modes.
 
-**🚀 Extreme Performance:** On Apple Silicon (M5), the highly optimized CPU implementation transcribes a 28.2s audio sample in just **676ms** (**41.69x realtime**), outperforming both the upstream pure C implementation and measured MLX GPU baselines.
+## Performance
 
+On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **470 ms** — about **60× faster than realtime**. It's faster than the upstream C implementation and the measured MLX GPU baselines.
 
-## Auto Research
+| Implementation | Median inference | Realtime factor |
+|---|---:|---:|
+| qwen-asr (latest) | 470 ms | 60.06× |
+| mlx-audio Python MLX | 674 ms | 41.79× |
+| second-state/qwen3_asr_rs MLX GPU | 1,333 ms | 21.13× |
+| pure C upstream | 1,610 ms | 17.50× |
+| qwen-asr (first Rust port) | 1,612 ms | 17.49× |
 
-Performance optimizations were discovered autonomously using the [autoresearch](https://github.com/karpathy/autoresearch) pattern: an AI agent loops over hypothesize-implement-benchmark-keep/revert cycles on the inference code. The experiment protocol is defined in [`program.md`](program.md).
+![Latency comparison](docs/benchmarks/charts/benchmark-unified-latency.png)
 
-## Benchmark
+![Realtime factor comparison](docs/benchmarks/charts/benchmark-unified-rtf.png)
 
-Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio using `bench/samples/audio.wav`). Implementations are benchmarked sequentially, not in parallel. The primary metric is median inference time, so model loading and process startup do not dominate comparisons.
+> Benchmarked on the same 28.2 s sample with 10 runs each. Latest qwen-asr uses all 15 CPU cores; the dedicated speed benchmark on performance cores reaches **447 ms / 63.09×**. See [`docs/benchmarks/comparison.md`](docs/benchmarks/comparison.md) for full details and reproduction steps.
 
-> **Note:** This is an ad-hoc, offline performance reference limited specifically to the Apple M5 architecture and a single audio sample. It is designed to quickly validate optimization efforts, rather than serving as a comprehensive industry-standard benchmark (such as LibriSpeech).
+## Documentation
 
-| Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |
-|---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 1,842 | 1,853 | 1,820 | 15.31x |
-| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 676 | 678 | 668 | 41.69x |
-| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,885 | 1,885 | 1,861 | 14.94x |
-| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) with MLX backend | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
-| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 801 | 820 | 788 | 35.16x |
-
-qwen-asr and pure C use internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization. Wall-clock time is still recorded for diagnostics and end-to-end command cost.
-
-<details>
-<summary>Wall-clock timing</summary>
-
-| Implementation | Commit | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |
-|---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 2,171 | 2,205 | 2,150 | 12.99x |
-| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 1,263 | 1,289 | 1,252 | 22.34x |
-| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 2,154 | 2,148 | 2,125 | 13.08x |
-| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,982 | 3,049 | 2,940 | 9.44x |
-| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 1,855 | 1,918 | 1,806 | 15.18x |
-
-</details>
-
-![Latency](bench/charts/benchmark-unified-latency.png)
-
-![Realtime factor](bench/charts/benchmark-unified-rtf.png)
-
-- 🏆 **Fastest overall**: `qwen-asr` latest (`0f5f065`)
-- 🚀 **2.72x faster** than the initial Rust port (`bf52daf`)
-- 🔥 **2.79x faster** than the upstream pure C implementation (`b00b789`)
-- 💥 **4.12x faster** than [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU
-- ⚡️ **1.18x faster** than [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX (8-bit)
-
-Reproduce all results:
-
-```bash
-# qwen-asr first + latest + pure C + second-state/qwen3_asr_rs + mlx-audio
-./bench/benchmark-all.sh --runs 10
-```
-
-### ⚡️ Why does pure CPU Rust beat GPU baselines?
-
-1. **Hand-optimized NEON kernels** — Custom `vDSP`/`Accelerate`, hand-written `neon_dotprod` matmul, and fused fast-attention specifically tuned for the 0.6B model and Apple Silicon cache hierarchy.
-2. **Zero framework overhead** — No tensor dispatch, memory pools, or FFI bridging. 100% Rust end-to-end.
-3. **Model too small for GPU** — A 0.6B model can't saturate the Metal GPU. Kernel launch overhead and CPU↔GPU copies dominate. Both MLX backends are ~2–4× slower than the CPU path.
-4. **mlx-audio 8-bit overhead** — Quantization saves memory but dequantization during compute adds extra work.
+- [`docs/benchmarks/`](docs/benchmarks/) — benchmark methodology, latest results, and reproduction instructions
+- [`docs/optimizations/overview.md`](docs/optimizations/overview.md) — catalog of implemented performance optimizations
+- [`docs/research/`](docs/research/) — historical autoresearch experiment logs and protocols
 
 ## Quick Start
 
@@ -83,20 +47,15 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/huangli
 
 ## Usage
 
-```
-qwen-asr -d <model_dir> (-i <file> | --stdin | --live) [options]
-```
-
 ```bash
 qwen-asr -d qwen3-asr-0.6b -i audio.wav              # basic
 qwen-asr -d qwen3-asr-0.6b -i audio.wav --silent      # transcript only
 cat audio.wav | qwen-asr -d qwen3-asr-0.6b --stdin     # pipe from stdin
-qwen-asr -d qwen3-asr-0.6b -i long.wav -S 30           # segmented (long audio)
+qwen-asr -d qwen3-asr-0.6b -i long.wav -S 30           # segmented
 qwen-asr -d qwen3-asr-0.6b -i audio.wav --stream       # streaming
 qwen-asr -d qwen3-asr-0.6b --live --device "BlackHole 2ch"         # live capture (macOS)
 qwen-asr -d qwen3-asr-0.6b --live --vad --device "BlackHole 2ch"   # VAD live
 qwen-asr -d qwen3-aligner-0.6b -i audio.wav --align "Hello world" --align-language English  # alignment
-ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --stdin        # raw PCM
 ```
 
 <details>
@@ -111,7 +70,7 @@ ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --st
 | `--device <name>` | Input device for live capture | system default |
 | `--list-devices` | List audio input devices | — |
 | `--vad` | VAD live mode | off |
-| `-t <n>` | Thread count | all CPUs |
+| `-t <n>` | Thread count | performance cores |
 | `-S <secs>` | Segment target seconds | 0 (full) |
 | `--stream` | Streaming mode | off |
 | `--stream-chunk-sec <s>` | Chunk size for streaming | 2.0 |
@@ -123,7 +82,7 @@ ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --st
 
 ## Build
 
-**Always use release mode.** Debug builds are 10-50x slower.
+**Always use release mode.** Debug builds are 10–50× slower.
 
 ```bash
 # macOS
@@ -147,8 +106,29 @@ cargo ndk -t arm64-v8a build --release --features android
 |---------|-------------|
 | `blas` (default) | BLAS linking (Accelerate on macOS, OpenBLAS on Linux) |
 | `vdsp` | Accelerate vDSP/vForce for AMX (macOS) |
-| `ios` | C-FFI API (`src/c_api.rs`) |
-| `android` | JNI API (`src/jni_api.rs`) |
+| `ios` | C-FFI API |
+| `android` | JNI API |
+
+## Reproducing Benchmarks
+
+```bash
+# Speed benchmark
+./bench/run.sh --label current --runs 10
+
+# WER benchmark (100-file LibriSpeech offline)
+python3 librispeech-wer-bench/librispeech_wer.py \
+  --dataset librispeech-wer-bench/dev-clean-2 \
+  --binary target/release/qwen-asr \
+  --model-dir qwen3-asr-0.6b \
+  --output-dir librispeech-wer-bench/results-100 \
+  --label current-offline-100 \
+  --limit 100 --mode offline
+
+# Cross-implementation comparison (30–60 min)
+./bench/benchmark-all.sh --runs 10
+```
+
+See [`docs/benchmarks/`](docs/benchmarks/) for full details.
 
 ## OpenClaw Skill
 

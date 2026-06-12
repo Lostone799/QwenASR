@@ -1,24 +1,32 @@
 # LibriSpeech WER Benchmark
 
-This directory contains Git-tracked WER benchmark scripts only. Downloaded
-datasets, result files, reports, archives, and temporary worktrees are ignored by
-Git.
+This directory contains Git-tracked WER benchmark scripts only. Downloaded datasets, result files, reports, archives, and temporary worktrees are ignored by Git.
 
-Run 100-file WER with an existing dataset:
+For the full methodology, latest results, and interpretation, see [`docs/benchmarks/results.md`](../docs/benchmarks/results.md).
+
+## Scripts
+
+| Script | Purpose |
+|---|---|
+| [`librispeech_wer.py`](librispeech_wer.py) | Run a single WER/CER evaluation pass against a LibriSpeech-style dataset. |
+| [`run_wer_range.py`](run_wer_range.py) | Evaluate WER across a git commit range by checking out each commit into a temporary worktree. |
+
+## Quick usage
+
+### 100-file offline WER
 
 ```bash
 python3 librispeech-wer-bench/librispeech_wer.py \
   --dataset librispeech-wer-bench/dev-clean-2 \
   --binary target/release/qwen-asr \
   --model-dir qwen3-asr-0.6b \
-  --output-dir librispeech-wer-bench/results \
+  --output-dir librispeech-wer-bench/results-100 \
   --label current-offline-100 \
   --limit 100 \
   --mode offline
 ```
 
-Download LibriSpeech `dev-clean` automatically if the dataset directory is
-missing:
+### Download `dev-clean` automatically
 
 ```bash
 python3 librispeech-wer-bench/librispeech_wer.py \
@@ -26,15 +34,22 @@ python3 librispeech-wer-bench/librispeech_wer.py \
   --dataset librispeech-wer-bench/dev-clean-2 \
   --binary target/release/qwen-asr \
   --model-dir qwen3-asr-0.6b \
-  --output-dir librispeech-wer-bench/results \
-  --label current-streaming-100 \
+  --output-dir librispeech-wer-bench/results-100 \
+  --label current-offline-100 \
   --limit 100 \
-  --mode streaming
+  --mode offline
 ```
 
-The default download URL is:
+Default download URL:
 
 ```text
 https://www.openslr.org/resources/12/dev-clean.tar.gz
 ```
 
+## Results layout
+
+```
+librispeech-wer-bench/results-100/<label>/
+├── results.jsonl   # per-utterance records
+└── summary.json    # aggregate WER/CER and failure list
+```

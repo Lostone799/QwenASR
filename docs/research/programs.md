@@ -1,10 +1,195 @@
-# QwenASR Codex Autoresearch Program
+# Autoresearch Programs
+
+This file collects the protocols that guided the autonomous optimization loops.
+
+## Contents
+
+- [QwenASR Autoresearch Program](#qwenasr-autoresearch-program)
+- [QwenASR Codex Autoresearch Program](#qwenasr-codex-autoresearch-program)
+
+## QwenASR Autoresearch Program
+
+## QwenASR Autoresearch Program
+
+> Autonomous optimization of the QwenASR Rust inference engine using the autoresearch pattern.
+> Human writes this file. Agent executes the loop.
+
+### Goal
+
+Maximize inference performance (lower latency, higher realtime factor) and/or improve transcription accuracy (lower WER/CER) of the QwenASR Rust inference engine on the current hardware, without breaking correctness.
+
+### Setup Phase (one-time, confirm with human)
+
+1. Create the branch: `git checkout -b autoresearch/<tag>` from current `main`.
+2. Read the in-scope files. The repo is a Rust workspace. Read these for full context:
+   - `README.md` — repository context, build instructions, feature flags
+   - `Cargo.toml` — workspace config, dependencies, features
+   - `crates/` — the core library crate(s)
+   - `src/` — CLI entry point and all core modules:
+     - `kernels/` — SIMD kernels (generic, NEON, AVX), BLAS bindings, thread pool ← **primary optimization target**
+     - `encoder.rs` — Conv2D stem + windowed transformer
+     - `decoder.rs` — GQA decoder + KV cache
+     - `audio.rs` — WAV decode, resample, mel spectrogram
+     - `transcribe.rs` — offline / segmented / streaming orchestration
+     - `config.rs`, `context.rs`, `safetensors.rs`, `tokenizer.rs`
+   - `bench/` — benchmark scripts and comparison tools
+   - `tests/` — kernel, audio, tokenizer, regression tests
+3. Verify model exists: Check that `qwen3-asr-0.6b/` (or `qwen3-asr-1.7b/`) contains model files. If not, tell the human to download them per README.
+4. Verify benchmark audio exists: Check `bench/samples/` for WAV files and `audio.wav` in root. If missing, tell human.
+5. Establish baseline:
+   ```bash
+   RUSTFLAGS="-C target-cpu=native" cargo build --release 2>&1 | tail -5
+   bench/run.sh --label baseline --runs 3
+   ```
+6. Initialize `results.tsv` with header:
+   ```
+   experiment	description	build_ok	test_ok	offline_time_ms	offline_rtf	segmented_time_ms	segmented_rtf	streaming_time_ms	streaming_rtf	status
+   ```
+   Record baseline results as experiment 0.
+7. Confirm setup looks good. Once you get human confirmation, kick off experimentation.
+
+### Experiment Loop
+
+Repeat indefinitely:
+
+#### 1. Pick an idea
+
+Choose ONE focused change per experiment. Ideas to explore (not exhaustive):
+
+**Kernel / SIMD optimizations:**
+- Vectorize hot loops that are still using generic.rs fallbacks
+- Improve NEON/AVX kernel implementations (fused ops, reduce branching)
+- Optimize matmul tiling, cache blocking, prefetch hints
+- Try different BLAS call patterns or batch sizes
+- Reduce unnecessary memory allocations in hot paths
+
+**Decoder / Encoder optimizations:**
+- KV cache memory layout (contiguous vs strided, pre-allocation)
+- Attention computation optimizations (fused softmax, flash-attention-style chunking)
+- Layer fusion opportunities (combine adjacent operations)
+- Reduce redundant computation in streaming mode rollback
+
+**Audio pipeline:**
+- Mel spectrogram computation optimization
+- FFT/windowing optimizations
+- Silence detection efficiency
+
+**Memory & allocation:**
+- Reduce heap allocations in the inference hot path
+- Use arena allocators or pre-allocated buffers
+- Optimize tensor layout for cache locality
+
+**Architecture-level:**
+- Parallelism tuning (thread count, work distribution)
+- Batch processing of encoder windows
+- Async I/O for audio loading
+
+#### 2. Implement the change
+
+Edit the relevant Rust source file(s). Keep changes minimal and focused. Write a clear git commit message describing the hypothesis.
+
+```bash
+git add -A && git commit -m "experiment: <brief description of change>"
+```
+
+#### 3. Build
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release 2>&1 > build.log
+```
+
+If build fails, read `tail -30 build.log`, attempt a fix. If you can't fix after 2 attempts, revert and move on.
+
+#### 4. Run tests (quick sanity check)
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo test --release --test kernels --test audio 2>&1 > test.log
+tail -5 test.log
+```
+
+If tests fail, the change broke correctness. Revert immediately.
+
+#### 5. Benchmark
+
+```bash
+bench/run.sh --label "exp-$(date +%s)" --runs 3 > bench.log 2>&1
+```
+
+If bench/run.sh is not available or doesn't work, fall back to direct timing:
+
+```bash
+## Offline mode benchmark
+time ./target/release/qwen-asr -d qwen3-asr-0.6b -i audio.wav --silent > /dev/null 2>&1
+
+## If segmented mode test audio exists:
+time ./target/release/qwen-asr -d qwen3-asr-0.6b -i bench/samples/audio.wav -S 30 --silent > /dev/null 2>&1
+```
+
+Run each 3 times, take the best (lowest) time.
+
+#### 6. Evaluate
+
+Extract timing results. Compare against the current best baseline.
+
+**Keep criteria (ALL must hold):**
+- Build succeeds
+- Tests pass
+- Inference time improved (even by a small margin) OR accuracy improved without significant speed regression
+- No correctness regression (spot-check transcript output hasn't degraded)
+
+#### 7. Keep or revert
+
+**If improved:**
+```bash
+## Record in results.tsv
+echo "<exp>\t<description>\tyes\tyes\t<offline_ms>\t<offline_rtf>\t<seg_ms>\t<seg_rtf>\t<stream_ms>\t<stream_rtf>\tkept" >> results.tsv
+## This commit stays. It becomes the new baseline.
+```
+
+**If not improved or regressed:**
+```bash
+echo "<exp>\t<description>\tyes\tyes\t<offline_ms>\t<offline_rtf>\t<seg_ms>\t<seg_rtf>\t<stream_ms>\t<stream_rtf>\treverted" >> results.tsv
+git reset --hard HEAD~1
+```
+
+#### 8. Repeat
+
+Go back to step 1. Try a different idea. Learn from what worked and what didn't.
+
+### Rules
+
+- **Do NOT modify test files** to make tests pass. If tests fail, the code change is wrong.
+- **Do NOT modify bench/ scripts** unless they are genuinely broken.
+- **One idea per experiment.** Compound changes make it impossible to attribute results.
+- **Always build in release mode** with `--release` and `target-cpu=native`.
+- **Redirect output.** Never let build/test/bench output flood your context. Use `> file.log 2>&1`.
+- **Be bold but reversible.** Try architectural changes, not just parameter tweaks. Git makes everything reversible.
+- **Track everything** in results.tsv. Do not commit results.tsv (keep it untracked).
+- **If stuck after 3 failed experiments in a row**, step back and re-read the source to find a new angle.
+- **Unsafe Rust:** You may use `unsafe` blocks for performance-critical SIMD code, but be extra careful. Run tests after every unsafe change.
+
+### Context for the Agent
+
+This is a pure Rust, CPU-only ASR inference engine. There is no GPU, no CUDA, no Python in the hot path. Performance gains come from:
+1. Better utilization of CPU SIMD (NEON on ARM, AVX2+FMA on x86)
+2. Better memory access patterns (cache-friendly layouts)
+3. Reducing allocations and copies
+4. Algorithmic improvements in the attention/matmul/FFT paths
+5. Better thread utilization
+
+The model weights are fixed (loaded from safetensors). You are optimizing the inference code, not training a model. The "loss function" here is wall-clock inference time for a given audio input.
+
+---
+
+## QwenASR Codex Autoresearch Program
+
+## QwenASR Codex Autoresearch Program
 
 > Autonomous optimization of the QwenASR Rust inference engine using a code-grounded experiment loop.
 > Human writes this file. Agent executes the loop indefinitely.
 > This version is allowed to implement, benchmark, keep, or revert changes.
 
-## Goal
+### Goal
 
 Run an infinite code-grounded optimization loop for the Rust CPU inference engine, with emphasis on:
 
@@ -22,18 +207,17 @@ Hard constraints for this document and the experiment loop:
 - every kept improvement must stay as a git commit
 - every reverted experiment must leave the branch clean except for this document and intentionally preserved notes
 
-## Setup Phase
+### Setup Phase
 
 1. Create the branch from current `main`:
    ```bash
    git checkout -b codex-auto-research
    ```
 2. Read the repository context and benchmark protocol:
-   - [README.md](README.md)
-   - [program.md](program.md)
-   - [report.md](report.md)
-   - [auto-research-changes.md](auto-research-changes.md)
-   - [bench/run.sh](bench/run.sh)
+   - [README.md](../README.md)
+   - [comparison.md](../benchmarks/comparison.md)
+   - [ledger.md](./ledger.md)
+   - [bench/run.sh](../../bench/run.sh)
 3. Read the current implementation hotspots and state holders:
    - [crates/qwen-asr/src/context.rs](crates/qwen-asr/src/context.rs)
    - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs)
@@ -58,7 +242,7 @@ Hard constraints for this document and the experiment loop:
    If assets are missing, record the blocked measurement and continue with the best available checks.
 6. Use this file as the living experiment protocol and ledger. Keep the backlog, baseline, and kept-experiment history current.
 
-### Baseline Snapshot
+#### Baseline Snapshot
 
 - Branch: `codex-auto-research`
 - Build: `RUSTFLAGS="-C target-cpu=native" cargo build --release` succeeded
@@ -81,7 +265,7 @@ Hard constraints for this document and the experiment loop:
   - encoder forward reuse of `x` and `window_starts` improved all three benchmark modes, even though the single `--profile` spot check was noisier than the benchmark sweep
   - the next experiment should likely stay in encoder/transcription memory reuse, especially reducing the remaining `enc_output` allocation or window metadata rebuilds
 
-### Kept Experiment Ledger
+#### Kept Experiment Ledger
 
 Append one entry for each kept optimization. Keep entries compact and chronological.
 
@@ -125,22 +309,22 @@ Template:
   - kept commit: `experiment: reuse encoder forward buffers`
   - notes: benchmark movement was clearly positive in all three modes, but the single direct `--profile` run did not improve proportionally; keep decision is based on the repeated benchmark sweep rather than that one noisier spot profile
 
-## Current State Map
+### Current State Map
 
 This section must keep a strict distinction between `already optimized`, `partially optimized / still leaking cost`, and `missing opportunity`.
 It is the map the agent should use to choose the next experiment.
 
-### Already optimized
+#### Already optimized
 
 - `decoder` single-token decode on `aarch64` already has INT8 coverage for `QKV`, `O-proj addto`, `SwiGLU`, and `argmax`.
   Evidence:
   - [crates/qwen-asr/src/decoder.rs](crates/qwen-asr/src/decoder.rs) quantizes decoder weights and `lm_head` at load time.
   - [crates/qwen-asr/src/kernels/mod.rs](crates/qwen-asr/src/kernels/mod.rs) wires `linear_nobias_int8_qkv`, `linear_nobias_int8_addto`, `linear_nobias_int8_swiglu`, and `argmax_matvec_int8`.
-  - [auto-research-changes.md](auto-research-changes.md) records these as prior kept wins.
+  - [ledger.md](ledger.md) records these as prior kept wins.
 - KV cache layout is already head-contiguous and tuned for causal attention scans.
   Evidence:
   - [crates/qwen-asr/src/decoder.rs](crates/qwen-asr/src/decoder.rs) stores cache as `[layer][head][pos][head_dim]`.
-  - [auto-research-changes.md](auto-research-changes.md) shows this was a major kept optimization.
+  - [ledger.md](ledger.md) shows this was a major kept optimization.
 - Encoder transformer path already includes several fused or threaded improvements.
   Evidence:
   - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs) uses `linear_accumulate()` for residual branches.
@@ -158,7 +342,7 @@ It is the map the agent should use to choose the next experiment.
   - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs) stores reusable `x` and `window_starts` inside `EncoderBuffers`.
   - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs) writes chunk projections and transformer updates directly into the reusable `x` slice.
 
-### Partially optimized / still leaking cost
+#### Partially optimized / still leaking cost
 
 - Decoder prefill layer projections no longer reconvert weights, but logits-oriented prefill still allocates fresh `x_norm` and `logits` and still converts the `lm_head` through BF16 scratch.
   Evidence:
@@ -177,7 +361,7 @@ It is the map the agent should use to choose the next experiment.
   Evidence:
   - [crates/qwen-asr/src/decoder.rs](crates/qwen-asr/src/decoder.rs) allocates fresh `x_norm` and `logits` in `decoder_prefill_logits()`.
 
-### Missing opportunity
+#### Missing opportunity
 
 - x86_64 INT8 decode kernels are still absent.
   Evidence:
@@ -194,14 +378,14 @@ It is the map the agent should use to choose the next experiment.
   Evidence:
   - [crates/qwen-asr/src/audio.rs](crates/qwen-asr/src/audio.rs) allocates `padded`, `windowed_all`, `re`, `im`, `power`, `mel`, plus silence-compaction helper buffers.
 
-## Experiment Loop
+### Experiment Loop
 
 Repeat indefinitely. Each pass is one experiment.
 
 1. Pick one focused idea from `Initial Prioritization` or `Opportunity Backlog`.
    Prefer the highest-priority item that still matches the current hotspot profile.
 2. Reconfirm the current implementation before editing.
-   Read the relevant call chain and check [auto-research-changes.md](auto-research-changes.md) so the experiment does not duplicate a kept optimization that already landed.
+   Read the relevant call chain and check [ledger.md](ledger.md) so the experiment does not duplicate a kept optimization that already landed.
 3. State the hypothesis in one sentence.
    Examples:
    - prepacking decoder prefill weights will cut repeated BF16 to F32 conversion cost
@@ -250,7 +434,7 @@ Rules for this loop:
 - always preserve kept improvements as explicit git commits
 - prefer benchmark evidence over intuition when choosing whether to keep a change
 
-## Opportunity Backlog
+### Opportunity Backlog
 
 Every entry below must keep the same fields, so an agent can convert backlog items directly into experiments:
 
@@ -262,7 +446,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
 - `Validation metrics`
 - `Risks / unknowns`
 
-### 1. Static weight prepack for decoder prefill and large heads
+#### 1. Static weight prepack for decoder prefill and large heads
 
 - `Priority`: `P0`
 - `Why`: decoder prefill repeatedly touches the same static matrices and still pays BF16 to F32 conversion plus row-major-to-kernel-unfriendly traversal on every invocation.
@@ -288,14 +472,14 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - load-time memory growth may be large on 1.7B
   - `blas` and `no-default-features` builds may want different pack layouts
 
-### 2. Encoder conv workspace reuse and stem specialization
+#### 2. Encoder conv workspace reuse and stem specialization
 
 - `Priority`: `P0`
 - `Why`: encoder stem is still a front-end ingestion hotspot with repeated buffer allocation and full `im2col` materialization.
 - `Current evidence`:
   - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs) allocates `chunk_mel`, `c1`, `c2`, `c3`, `reshaped`, and `pe` per chunk.
   - [crates/qwen-asr/src/kernels/mod.rs](crates/qwen-asr/src/kernels/mod.rs) allocates `cols` in each `conv2d()`.
-  - [auto-research-changes.md](auto-research-changes.md) shows threaded `im2col` helped, implying the path is still relevant.
+  - [ledger.md](ledger.md) shows threaded `im2col` helped, implying the path is still relevant.
 - `Likely touch points`:
   - [crates/qwen-asr/src/encoder.rs](crates/qwen-asr/src/encoder.rs)
   - [crates/qwen-asr/src/context.rs](crates/qwen-asr/src/context.rs)
@@ -313,7 +497,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - workspace sizing depends on chunk width and model size
   - specialized stem path must preserve current padding semantics exactly
 
-### 3. x86_64 INT8 decode coverage
+#### 3. x86_64 INT8 decode coverage
 
 - `Priority`: `P0`
 - `Why`: the highest-value single-token decode kernels exist on `aarch64` but are explicitly absent on `x86_64`.
@@ -336,7 +520,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - AVX2 is the minimum viable target; VNNI/AVX512VNNI should remain optional
   - epilogue fusion choices may constrain shared abstractions with `aarch64`
 
-### 4. Eliminate `conv3 -> reshaped -> conv_out` full reorder
+#### 4. Eliminate `conv3 -> reshaped -> conv_out` full reorder
 
 - `Priority`: `P1`
 - `Why`: even after conv outputs are computed, the encoder currently performs a full tensor re-layout before the projection into model width.
@@ -356,7 +540,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
 - `Risks / unknowns`:
   - BLAS expects dense row-major inputs; a direct projection path may need a custom kernel or tile packing
 
-### 5. Direct KV-cache write path for prefill K/V
+#### 5. Direct KV-cache write path for prefill K/V
 
 - `Priority`: `P1`
 - `Why`: prefill currently materializes interleaved `pref_k` and `pref_v` buffers and then scatters them into the head-contiguous KV cache.
@@ -377,7 +561,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - rope and per-head RMSNorm currently operate on the interleaved layout
   - fused direct write may complicate code reuse with single-token decode
 
-### 6. Reusable transcription embedding workspace
+#### 6. Reusable transcription embedding workspace
 
 - `Priority`: `P1`
 - `Why`: top-level transcription and streaming flows repeatedly allocate and copy large prompt plus encoder embedding buffers even though the sequence shape is predictable enough to reuse storage.
@@ -399,7 +583,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - sequence lengths vary between modes
   - ownership between `QwenCtx`, streaming state, and aligner helpers must stay clear
 
-### 7. Streaming LCP reuse without float-row snapshot cloning
+#### 7. Streaming LCP reuse without float-row snapshot cloning
 
 - `Priority`: `P1`
 - `Why`: current reuse logic persists the previous prefix as raw float embeddings and compares row-by-row, which is expensive and fragile versus token-level reuse metadata.
@@ -421,7 +605,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - prefix equality in embedding space currently also covers encoder output positions, not just tokens
   - cache key design must distinguish prompt, encoder, suffix, and carryover text regions
 
-### 8. Tokenizer and prompt cache lifetime cleanup
+#### 8. Tokenizer and prompt cache lifetime cleanup
 
 - `Priority`: `P1`
 - `Why`: tokenizer reload is not the hottest inner-loop issue, but repeated top-level invocations still pay repeated JSON loading and prompt re-encoding costs.
@@ -441,7 +625,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
 - `Risks / unknowns`:
   - keeping tokenizer in `QwenCtx` affects load semantics and memory lifetime
 
-### 9. Audio front-end workspace and FFT-specific specialization
+#### 9. Audio front-end workspace and FFT-specific specialization
 
 - `Priority`: `P2`
 - `Why`: the mel front-end still materializes several whole-frame matrices and may be leaving performance on the table versus reusable workspace or real-FFT-specific paths.
@@ -464,7 +648,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - existing BLAS batching may already be close to optimal on some machines
   - real FFT path must match current spectrogram numerics closely enough
 
-### 10. Thread-local scratch buffers for fused kernels
+#### 10. Thread-local scratch buffers for fused kernels
 
 - `Priority`: `P2`
 - `Why`: several fused kernels still allocate per-thread temporary `Vec`s inside hot closures.
@@ -484,7 +668,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - thread-local scratch adds complexity to the custom thread pool
   - benefits may be small after larger P0 work lands
 
-### 11. Parallel load-time pack and quantize
+#### 11. Parallel load-time pack and quantize
 
 - `Priority`: `P2`
 - `Why`: once more load-time prepack work is added, model startup can become the new bottleneck; research should include how to parallelize that work safely.
@@ -506,7 +690,7 @@ Every entry below must keep the same fields, so an agent can convert backlog ite
   - loading already relies on mmap lifetimes and owned fused buffers
   - parallelization strategy should not over-contend with BLAS or OS page faults
 
-### Candidate Internal Design Sketches
+#### Candidate Internal Design Sketches
 
 These are internal implementation sketches only. They are not public API proposals.
 
@@ -548,11 +732,11 @@ These are internal implementation sketches only. They are not public API proposa
 
 Public API note: this research track assumes no public API changes. All candidate types above are internal ownership and layout aids only.
 
-## Measurement Plan
+### Measurement Plan
 
 All measurements in this phase support keep/revert decisions. Always benchmark after implementing a change, and prefer the smallest benchmark set that still validates the hypothesis.
 
-### Core commands
+#### Core commands
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release
@@ -564,7 +748,7 @@ bench/run.sh --runs 3 --label codex-research
 ./target/release/qwen-asr -d qwen3-aligner-0.6b -i audio.wav --align "Hello world" --align-language English --profile
 ```
 
-### Observation buckets
+#### Observation buckets
 
 - `offline`
   - total latency
@@ -583,7 +767,7 @@ bench/run.sh --runs 3 --label codex-research
   - per-position logits overhead
   - effect of `lm_head` or classify-head related opportunities
 
-### Topic-specific checks
+#### Topic-specific checks
 
 - static weight prepack:
   - compare first prefill versus repeated prefill
@@ -601,7 +785,7 @@ bench/run.sh --runs 3 --label codex-research
 
 If a measurement is blocked by missing local assets or hardware, note the blocker explicitly and use the next-best measurement rather than guessing.
 
-## Rules
+### Rules
 
 - Allowed actions:
   - static reading and code search
@@ -623,9 +807,9 @@ If a measurement is blocked by missing local assets or hardware, note the blocke
 - When a kept experiment lands, ensure the working tree is clean except for intentional documentation updates.
 - When an experiment loses, revert it completely before starting the next one.
 
-## Initial Prioritization
+### Initial Prioritization
 
-### First wave
+#### First wave
 
 1. Static weight prepack for decoder prefill and large heads
    - highest expected payoff because it attacks repeated BF16 to F32 conversion and scratch traffic on static weights
@@ -634,7 +818,7 @@ If a measurement is blocked by missing local assets or hardware, note the blocke
 3. x86_64 INT8 decode coverage
    - highest platform-coverage payoff and most obvious missing hot path
 
-### Second wave
+#### Second wave
 
 4. Eliminate `conv3 -> reshaped -> conv_out` reorder
 5. Direct KV-cache write path for prefill K/V
@@ -642,13 +826,13 @@ If a measurement is blocked by missing local assets or hardware, note the blocke
 7. Streaming LCP reuse without float-row snapshot cloning
 8. Tokenizer and prompt cache lifetime cleanup
 
-### Third wave
+#### Third wave
 
 9. Audio front-end workspace and FFT specialization
 10. Thread-local scratch buffers for fused kernels
 11. Parallel load-time pack and quantize
 
-### Default assumptions for follow-up implementation
+#### Default assumptions for follow-up implementation
 
 - No public API changes.
 - `aarch64` and `x86_64` may diverge in internal packed layout.
@@ -659,3 +843,6 @@ If a measurement is blocked by missing local assets or hardware, note the blocke
   - then add architecture-specific microkernels
 - Do not start from more SIMD micro-functions unless the data path above is already cleaned up.
 - If a smaller precursor change can de-risk a larger `P0` idea, it is acceptable as long as it is benchmarked and committed separately.
+
+---
+

@@ -18,7 +18,7 @@ CURRENT_REF="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
 C_REPO_URL="https://github.com/antirez/qwen-asr.git"
 UPSTREAM_REF="main"
 SECOND_STATE_REPO="https://github.com/second-state/qwen3_asr_rs.git"
-SECOND_STATE_REF="main"
+SECOND_STATE_REF="v0.2.0"
 MLX_AUDIO_VENV="$SCRIPT_DIR/.venv-mlx-audio"
 MLX_AUDIO_MODEL="mlx-community/Qwen3-ASR-0.6B-8bit"
 DO_CLEAN=0
@@ -181,12 +181,23 @@ ensure_worktree() {
     git -C "$PROJECT_DIR" worktree add --force --detach "$path" "$ref" >/dev/null
 }
 
+reset_to_ref() {
+    local path="$1" ref="$2"
+    # Tags are not available as origin/<tag>; fetch the tag explicitly then reset to the local ref.
+    if git -C "$path" rev-parse -q --verify "refs/tags/$ref" >/dev/null 2>&1; then
+        git -C "$path" fetch --depth 1 origin "refs/tags/$ref:refs/tags/$ref" >/dev/null
+        git -C "$path" reset --hard "$ref" >/dev/null
+    else
+        git -C "$path" fetch --depth 1 origin "$ref" >/dev/null
+        git -C "$path" reset --hard "origin/$ref" >/dev/null
+    fi
+}
+
 ensure_c_clone() {
     local path="$1"
     if [[ -d "$path/.git" ]]; then
         log "Updating C repo clone"
-        git -C "$path" fetch --depth 1 origin "$UPSTREAM_REF" >/dev/null
-        git -C "$path" reset --hard "origin/$UPSTREAM_REF" >/dev/null
+        reset_to_ref "$path" "$UPSTREAM_REF"
         git -C "$path" clean -fd >/dev/null
     else
         rm -rf "$path"
@@ -199,8 +210,7 @@ ensure_second_state_clone() {
     local path="$1"
     if [[ -d "$path/.git" ]]; then
         log "Updating second-state repo clone"
-        git -C "$path" fetch --depth 1 origin "$SECOND_STATE_REF" >/dev/null
-        git -C "$path" reset --hard "origin/$SECOND_STATE_REF" >/dev/null
+        reset_to_ref "$path" "$SECOND_STATE_REF"
         git -C "$path" clean -fd >/dev/null
     else
         rm -rf "$path"
@@ -255,13 +265,13 @@ old = """    // Run transcription
 new = """    // Run transcription
     tracing::info!(\"Transcribing: {}\", audio_file);
     #[cfg(feature = \"mlx\")]
-    qwen3_asr_rs::backend::mlx::stream::synchronize();
+    qwen3_asr::backend::mlx::stream::synchronize();
     let inference_t0 = std::time::Instant::now();
     let result = model
         .transcribe(audio_file, language)
         .context(\"Transcription failed\")?;
     #[cfg(feature = \"mlx\")]
-    qwen3_asr_rs::backend::mlx::stream::synchronize();
+    qwen3_asr::backend::mlx::stream::synchronize();
     let inference_ms = inference_t0.elapsed().as_secs_f64() * 1000.0;
 
     // Output result
@@ -280,10 +290,10 @@ ensure_mlx_audio() {
         log "Creating mlx-audio venv at $MLX_AUDIO_VENV"
         python3 -m venv "$MLX_AUDIO_VENV"
     fi
-    if ! "$MLX_AUDIO_VENV/bin/python" -c "import mlx_audio" >/dev/null 2>&1; then
-        log "Installing mlx-audio"
-        "$MLX_AUDIO_VENV/bin/pip" install -U mlx-audio >/dev/null
-    fi
+    log "Installing/upgrading mlx-audio"
+    "$MLX_AUDIO_VENV/bin/pip" install -U mlx-audio >/dev/null
+    MLX_AUDIO_VERSION="$($MLX_AUDIO_VENV/bin/pip show mlx-audio 2>/dev/null | awk '/^Version:/ {print $2}' || echo 'unknown')"
+    log "mlx-audio version: $MLX_AUDIO_VERSION"
 }
 
 write_result_json() {
@@ -720,7 +730,7 @@ benchmark_mlx_audio() {
     done
 
     if [[ ! -s "$runs_tsv" ]]; then
-        write_result_json "$SUMMARY_DIR/$label-offline.json" "mlx-audio" false "offline" true false true null null "" "All mlx-audio runs failed; see $best_run_log" "$best_run_log" "0.4.3" "$TIMESTAMP" false
+        write_result_json "$SUMMARY_DIR/$label-offline.json" "mlx-audio" false "offline" true false true null null "" "All mlx-audio runs failed; see $best_run_log" "$best_run_log" "$MLX_AUDIO_VERSION" "$TIMESTAMP" false
         rm -f "$runs_tsv"
         return
     fi
@@ -737,7 +747,7 @@ benchmark_mlx_audio() {
     wall_best_ms="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["wall_best_ms"])' "$stats_json")"
     rtf="$(calc_rtf_from_ms "$best_ms")"
     wall_rtf="$(calc_rtf_from_ms "$best_wall_ms")"
-    write_result_json "$SUMMARY_DIR/$label-offline.json" "mlx-audio" false "offline" true true true "$best_ms" "$rtf" "$best_transcript" "Median of standalone runs; inference time excludes process startup and model load; wall-clock retained as wall_clock_ms" "$best_run_log" "0.4.3" "$TIMESTAMP" false "$best_wall_ms" "$wall_rtf" "$inference_mean_ms" "$inference_best_ms" "$wall_mean_ms" "$wall_best_ms"
+    write_result_json "$SUMMARY_DIR/$label-offline.json" "mlx-audio" false "offline" true true true "$best_ms" "$rtf" "$best_transcript" "Median of standalone runs; inference time excludes process startup and model load; wall-clock retained as wall_clock_ms" "$best_run_log" "$MLX_AUDIO_VERSION" "$TIMESTAMP" false "$best_wall_ms" "$wall_rtf" "$inference_mean_ms" "$inference_best_ms" "$wall_mean_ms" "$wall_best_ms"
     rm -f "$runs_tsv"
 }
 

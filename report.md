@@ -4,7 +4,7 @@
 
 - Offline benchmark on the same input WAV and model across five implementations.
 - qwen-asr first: `bf52daf`.
-- qwen-asr latest: `0f5f065`.
+- qwen-asr latest: `9ecde04`.
 - Upstream C: `antirez/qwen-asr`.
 - GPU baselines: `second-state/qwen3_asr_rs` MLX and `mlx-audio` Python MLX.
 - Implementations are benchmarked sequentially, not in parallel; each round is a standalone process invocation.
@@ -14,14 +14,15 @@
 - Wall-clock time is retained as a secondary metric.
 - Standalone rounds per target: `10`.
 - Modes requested: `offline`.
+- Results in the table and charts are sorted by median inference latency (fastest leftmost).
 
 ## Environment
 
-- CPU: `Apple M5`
-- Cores: `10 physical / 10 logical`
-- Memory: `32.0 GB`
+- CPU: `Apple M5 Pro`
+- Cores: `15 physical / 15 logical`
+- Memory: `48.0 GB`
 - Machine arch: `arm64`
-- macOS: `26.4.1`
+- macOS: `26.4`
 - Rustc: `rustc 1.90.0 (1159e78c4 2025-09-14)`
 - Model dir: `/Users/lizhuo/owork/q-asr/qwen3-asr-0.6b`
 - Input file: `/Users/lizhuo/owork/q-asr/bench/samples/audio.wav`
@@ -30,22 +31,22 @@
 
 | Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |
 |---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | `bf52daf` | `1,842` | `1,853` | `1,820` | `15.31x` |
-| qwen-asr (latest) | `0f5f065` | `676` | `678` | `668` | `41.69x` |
-| pure C upstream | `b00b789` | `1,885` | `1,885` | `1,861` | `14.94x` |
-| second-state MLX GPU | `3fa6734` | `2,785` | `2,808` | `2,745` | `10.11x` |
-| mlx-audio Python MLX | `0.4.3` | `801` | `820` | `788` | `35.16x` |
+| qwen-asr (latest) | `9ecde04` | `470` | `469` | `465` | `60.06x` |
+| mlx-audio Python MLX | `0.4.4` | `674` | `688` | `669` | `41.79x` |
+| second-state MLX GPU | `0226270` | `1,333` | `1,334` | `1,323` | `21.13x` |
+| pure C upstream | `b00b789` | `1,610` | `1,612` | `1,598` | `17.50x` |
+| qwen-asr (first) | `bf52daf` | `1,612` | `1,612` | `1,597` | `17.49x` |
 
 <details>
 <summary>Wall-clock timing</summary>
 
 | Implementation | Commit | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |
 |---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | `bf52daf` | `2,171` | `2,205` | `2,150` | `12.99x` |
-| qwen-asr (latest) | `0f5f065` | `1,263` | `1,289` | `1,252` | `22.34x` |
-| pure C upstream | `b00b789` | `2,154` | `2,148` | `2,125` | `13.08x` |
-| second-state MLX GPU | `3fa6734` | `2,982` | `3,049` | `2,940` | `9.44x` |
-| mlx-audio Python MLX | `0.4.3` | `1,855` | `1,918` | `1,806` | `15.18x` |
+| qwen-asr (latest) | `9ecde04` | `859` | `896` | `851` | `32.83x` |
+| mlx-audio Python MLX | `0.4.4` | `1,703` | `1,773` | `1,673` | `16.54x` |
+| second-state MLX GPU | `0226270` | `1,520` | `1,553` | `1,482` | `18.52x` |
+| pure C upstream | `b00b789` | `1,875` | `1,879` | `1,866` | `15.02x` |
+| qwen-asr (first) | `bf52daf` | `1,952` | `1,991` | `1,935` | `14.45x` |
 
 </details>
 
@@ -55,8 +56,8 @@
 
 ## Findings
 
-- qwen-asr latest `0f5f065` is `2.72x` the speed of qwen-asr first `bf52daf`.
-- qwen-asr latest `0f5f065` is `2.79x` faster than the upstream pure C implementation.
-- qwen-asr latest `0f5f065` is `4.12x` faster than second-state MLX GPU by inference latency.
-- qwen-asr latest `0f5f065` is `1.18x` faster than mlx-audio Python MLX by inference latency.
+- qwen-asr latest `9ecde04` is `3.43x` the speed of qwen-asr first `bf52daf`.
+- qwen-asr latest `9ecde04` is `3.43x` faster than the upstream pure C implementation.
+- qwen-asr latest `9ecde04` is `2.84x` faster than second-state MLX GPU by inference latency.
+- qwen-asr latest `9ecde04` is `1.44x` faster than mlx-audio Python MLX by inference latency.
 

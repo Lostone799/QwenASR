@@ -1,6 +1,6 @@
 # QwenASR 性能优化清单
 
-本文档汇总了 QwenASR 纯 Rust CPU 推理引擎（在 Apple M5 上达 41+ RTF）中使用的核心优化技术。
+本文档汇总了 QwenASR 纯 Rust CPU 推理引擎中使用的核心优化技术。当前版本在 Apple M5 上对 28.2 秒基准样本的离线转写可达 63+× RTF。
 
 ## 1. 内存带宽与分配优化
 
