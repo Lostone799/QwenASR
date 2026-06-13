@@ -2040,3 +2040,30 @@ Decision: **Rejected/deferred for current speed gate.** Keep the current direct
 stage calls and existing shape gates. Revisit scheduler abstractions only after
 kernel-shape benchmark tooling identifies specific profitable crossovers. No
 code change was made.
+
+### G35: Tiny-shape kernels and fused low-bit dequant-dot kernels
+
+Idea from `ggml-idea.md`:
+- Add tiny-shape specialized kernels for common qwen-asr dimensions where
+  BLAS/custom-kernel crossover points are known from benchmarks.
+- Add fused dequantize-dot-accumulate kernels for future low-bit formats so
+  dequantized f32 blocks are not materialized.
+
+Audit:
+- Current decode already uses specialized single-token INT8 matvec and argmax
+  kernels for QKV, output projection, FFN, and lm_head on aarch64.
+- Current prefill and encoder paths route larger matrix products through
+  Accelerate SGEMM, which previous experiments showed is difficult to beat for
+  these sizes.
+- E8 already replaced many tiny prefill attention BLAS calls with batched GEMM
+  attention and was accepted.
+- Round 3 D1 and B1/B6 show that small kernel dispatch changes can be noisy or
+  regress without targeted shape evidence.
+- Fused dequant-dot kernels only make sense once a kept Q4/Q5/K-quant-style
+  weight format exists. The current accepted low-bit runtime format is INT8
+  with per-row scales; naive INT4 was rejected in E12.
+
+Decision: **Rejected/deferred for current speed gate.** Do not add speculative
+microkernels without measured shape crossovers, and do not add fused low-bit
+dequant kernels before a validated low-bit format exists. No code change was
+made.

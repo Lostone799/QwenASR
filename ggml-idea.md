@@ -14,9 +14,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## CPU Kernels
 
-- Add tiny-shape specialized kernels for common qwen-asr dimensions where BLAS/custom-kernel crossover points are known from benchmarks.
-- Add fused dequantize-dot-accumulate kernels for future low-bit formats so dequantized f32 blocks are not materialized.
-
 ## Attention and KV Cache
 
 - Evaluate true tiled flash-attention-style prefill for larger contexts. E8 accepted batched-GEMM prefill attention, but a memory-efficient tiled implementation remains a separate idea.
