@@ -1246,3 +1246,109 @@ Remaining ideas from `unchecked-ideas.md` not yet tested:
 
 *All Round 3 ideas have now been checked.*
 
+---
+
+## Speed Improvement Experiments — Round 4 (ggml-idea.md)
+
+Goal: work through the remaining methods in `ggml-idea.md` one by one. Keep and
+commit changes only when they improve speed without pushing the 100-file
+LibriSpeech offline WER above `0.04`; otherwise revert the code change and record
+the result here. After all ideas are checked, remove `ggml-idea.md`.
+
+Machine: Apple M5 Pro. Model: `qwen3-asr-0.6b`. Speed via
+`bench/run.sh --runs 10` unless noted.
+
+### Baseline (Round 4 start)
+
+Branch: `feat/explor-more-idea-with-fable`.
+
+| Mode | Wall (ms) | Inference (ms) | Speed-sample WER |
+|------|-----------|----------------|------------------|
+| offline | 1278 | 779 | 0.9189 |
+| segmented -S30 | 641 | 342 | 0.9189 |
+| streaming | 646 | 355 | 0.9189 |
+
+Note: the 28 s speed sample triggers the long-audio cap, so its WER is expected
+to be poor and is not the release WER gate. The gate remains the 100-file
+LibriSpeech offline WER.
+
+### G1: Reusable activation INT8 quantization scratch
+
+Idea from `ggml-idea.md`: reuse a `Vec<i8>` in `DecoderBuffers` for the
+single-token f32→INT8 activation quantization instead of allocating a fresh
+temporary inside each INT8 matvec and lm_head argmax.
+
+Change:
+- Added a reusable `int8_scratch` buffer to `DecoderBuffers`.
+- Threaded `&mut Vec<i8>` through the aarch64 INT8 QKV, O-proj, SwiGLU,
+  down-proj, and lm_head argmax paths.
+- Replaced allocation-returning activation quantization with an in-place
+  `quantize_f32_to_int8_into` helper.
+
+Initial run vs noisy Round 4 baseline looked mixed, so a direct A/B was run by
+temporarily reverting only the code patch and rebuilding.
+
+| Mode | Baseline A/B inference | Scratch inference | Baseline A/B wall | Scratch wall |
+|------|-----------------------:|------------------:|------------------:|-------------:|
+| offline | 446 | 451 | 725 | 744 |
+| segmented -S30 | 325 | 328 | 607 | 616 |
+| streaming | 337 | 354 | 621 | 636 |
+
+Decision: **Rejected.** Reusing the activation quantization buffer regressed all
+three modes in the direct A/B. The allocation cost is either optimized well
+enough by the allocator or hidden by the bandwidth-bound matvec work; the extra
+mutable buffer threading did not help. Code changes were fully reverted.
+
+### G2: `mlock` safetensors mappings
+
+Idea from `ggml-idea.md`: keep model pages resident for latency-sensitive runs.
+
+Change:
+- Added a best-effort `libc::mlock(data, file_size)` immediately after the
+  existing `madvise(MADV_WILLNEED)` for each safetensors mmap.
+- Failures were ignored.
+
+Results:
+
+| Mode | Round 4 baseline wall | G2 wall | Round 4 baseline inference | G2 inference |
+|------|----------------------:|--------:|---------------------------:|-------------:|
+| offline | 1278 | 885 | 779 | 434 |
+| segmented -S30 | 641 | 770 | 342 | 320 |
+| streaming | 646 | 794 | 355 | 331 |
+
+Decision: **Rejected.** Inference after loading improved, but end-to-end wall
+time regressed for segmented and streaming because page locking adds startup
+cost. The initial offline baseline was noisy, so the consistent wall regression
+in the other modes is the deciding signal. Code changes were fully reverted.
+
+### G3: Superpages for KV cache allocation
+
+Idea from `ggml-idea.md`: extend superpage/hugepage policy beyond current hot
+decoder weight buffers, starting with the large decoder KV cache.
+
+Change:
+- Changed `KvCache::new` and `KvCache::grow` to allocate K/V buffers with the
+  existing 2 MB-aligned `superpage_vec::<f32>()` helper.
+- No math, layout, or cache indexing changed.
+
+Speed results:
+
+| Mode | Baseline A/B inference | G3 inference | Baseline A/B wall | G3 wall |
+|------|-----------------------:|-------------:|------------------:|--------:|
+| offline | 446 | 435 | 725 | 713 |
+| segmented -S30 | 325 | 318 | 607 | 597 |
+| streaming | 337 | 328 | 621 | 605 |
+
+WER gate:
+- Correct dataset path: `librispeech-wer-bench/dev-clean-2`
+- 100-file offline corpus WER: **0.0379**
+- Macro WER: **0.0418**
+- Corpus CER: **0.0152**
+
+Note: an earlier run accidentally used the script default `dev-clean-2` at the
+repo root after auto-downloading full LibriSpeech; that changed the first 100
+utterances and produced corpus WER `0.1567`. The project-documented gate uses
+`librispeech-wer-bench/dev-clean-2`.
+
+Decision: **Accepted.** KV cache superpage allocation improves all three speed
+modes in direct comparison and preserves the documented 100-file WER gate.

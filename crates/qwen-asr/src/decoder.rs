@@ -304,8 +304,8 @@ impl KvCache {
     pub fn new(n_layers: usize, max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Self {
         let total = n_layers * n_kv_heads * max_seq * head_dim;
         KvCache {
-            k: vec![0.0f32; total],
-            v: vec![0.0f32; total],
+            k: superpage_vec::<f32>(total),
+            v: superpage_vec::<f32>(total),
             len: 0,
             max_seq,
             n_layers,
@@ -328,8 +328,8 @@ impl KvCache {
         let new_head_stride = new_max * self.head_dim;
         let total = self.n_layers * self.n_kv_heads * new_head_stride;
 
-        let mut new_k = vec![0.0f32; total];
-        let mut new_v = vec![0.0f32; total];
+        let mut new_k = superpage_vec::<f32>(total);
+        let mut new_v = superpage_vec::<f32>(total);
 
         let copy_len = self.len * self.head_dim;
         for l in 0..self.n_layers {
