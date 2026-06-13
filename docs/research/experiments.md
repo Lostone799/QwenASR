@@ -1743,3 +1743,22 @@ Audit:
 Decision: **Rejected/deferred for this round.** Server residency and
 multi-session batching need a shared-weight/session-state split and a server or
 batch benchmark gate before they can be evaluated. No code change was made.
+
+### G22: Cache metadata for future derived artifacts
+
+Idea from `ggml-idea.md`: add cache metadata including source tensor identity,
+CPU feature target, quantization format, packed layout, and kernel/cache version
+for future derived artifacts.
+
+Audit:
+- A1 implemented a pre-quantized weight cache with source-file identity and
+  invalidation metadata, but it was rejected because reading a 3.2 GB owned
+  cache was slower than the existing mmap + conversion path.
+- That cache code was fully reverted; there is no current `weight_cache.rs` or
+  accepted derived-artifact format in the tree.
+- Metadata by itself cannot improve speed, WER, load time, or RSS without an
+  accepted packed/cache artifact to describe.
+
+Decision: **Rejected/no-op for this round.** Revisit metadata only alongside a
+kept mmap-backed packed weight cache or calibrated quantized sidecar. No code
+change was made.
