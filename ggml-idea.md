@@ -16,8 +16,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Attention and KV Cache
 
-- Evaluate true tiled flash-attention-style prefill for larger contexts. E8 accepted batched-GEMM prefill attention, but a memory-efficient tiled implementation remains a separate idea.
-
 ## Scheduling, Batching, and Threading
 
 ## Audio and ASR Pipeline

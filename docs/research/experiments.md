@@ -2067,3 +2067,27 @@ Decision: **Rejected/deferred for current speed gate.** Do not add speculative
 microkernels without measured shape crossovers, and do not add fused low-bit
 dequant kernels before a validated low-bit format exists. No code change was
 made.
+
+### G36: True tiled flash-attention-style decoder prefill
+
+Idea from `ggml-idea.md`: evaluate a memory-efficient tiled flash-attention-style
+prefill implementation for larger contexts.
+
+Audit:
+- E8 already accepted the high-value prefill attention change: replacing many
+  tiny per-query BLAS calls with batched per-head GEMMs.
+- After E8/G10, `attention_causal_ms` on the standard offline profile is about
+  **25 ms** out of **446 ms** total inference, while SGEMM and convolution
+  dominate the profile.
+- The current multi-token path stores one `scores` buffer sized `seq_q * seq_k`
+  per head and uses two Accelerate SGEMM calls plus vDSP softmax. For the
+  current short-utterance and 28-second speed gates, this memory footprint is
+  not the limiting cost.
+- A true tiled flash attention kernel would mostly help much larger contexts or
+  memory-pressure cases, and would need careful causal masking, online softmax
+  recurrence, and WER validation.
+
+Decision: **Rejected/deferred for current speed gate.** The profitable part of
+flash-style prefill was already accepted in E8. A fully tiled implementation is
+not justified until larger-context benchmarks show attention memory traffic as
+a bottleneck. No code change was made.
