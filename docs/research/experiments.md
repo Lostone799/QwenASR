@@ -1352,3 +1352,29 @@ utterances and produced corpus WER `0.1567`. The project-documented gate uses
 
 Decision: **Accepted.** KV cache superpage allocation improves all three speed
 modes in direct comparison and preserves the documented 100-file WER gate.
+
+### G4: Vectorized fast SwiGLU in single-token INT8 path
+
+Idea from `ggml-idea.md`: use existing lookup/polynomial approximations for hot
+scalar activations where accuracy allows.
+
+Change:
+- Replaced the scalar `g / (1 + exp(-g)) * u` loop inside
+  `linear_nobias_int8_swiglu` with the existing aarch64
+  `neon::swiglu_interleaved` fast-exp implementation over the local gate/up
+  buffer.
+- The prefill SwiGLU path already used this vectorized kernel; this only tested
+  the single-token INT8 decode path.
+
+Results:
+
+| Mode | G3 inference | G4 inference | G3 wall | G4 wall |
+|------|-------------:|-------------:|--------:|--------:|
+| offline | 435 | 447 | 713 | 724 |
+| segmented -S30 | 318 | 348 | 597 | 642 |
+| streaming | 328 | 372 | 605 | 676 |
+
+Decision: **Rejected.** The vectorized fast-exp path regressed every mode. The
+extra function/kernel overhead on small per-thread gate/up chunks outweighed any
+benefit from SIMD approximation. Code changes were fully reverted before running
+WER.
