@@ -2151,3 +2151,35 @@ Decision: **Rejected/deferred for current speed gate.** Do not implement another
 ad hoc quantization probe in this round. The next viable quantization step is a
 dedicated calibration program plus low-bit kernels and WER matrix, not a small
 runtime patch. No code change was made.
+
+### G39: Kernel-shape benchmark tooling and automated sweeps
+
+Ideas from `ggml-idea.md`:
+- Add kernel-shape benchmark tooling similar to llama-bench for matvec, GEMM,
+  attention, convolution, quantize, dequantize, lm_head argmax, and mel.
+- Add automated sweeps for chunk size, prefill batch size, quantization format,
+  KV cache type, VAD aggressiveness, and backend choice.
+
+Audit:
+- `bench/run.sh` already covers end-to-end offline, segmented, and streaming
+  latency; Round 4 G8/G11 added system metadata, CPU features, cache-state
+  notes, and peak RSS.
+- The internal kernels are mostly private Rust functions and many depend on
+  project-specific buffers, model dimensions, or loaded model weights. A real
+  llama-bench-style harness would require a new public/internal benchmark
+  target, deterministic fixture generation, and careful parity with the
+  production dispatch path.
+- Several requested sweep dimensions are not independent CLI knobs today:
+  quantization format, KV cache type, prefill batch size, and backend choice
+  currently require code changes or alternate runtime implementations.
+- Chunk size and VAD-like policy knobs have already been heavily swept in
+  Round 1 quality/speed experiments; repeating them in a generic sweep would
+  not check a new ggml-derived method.
+- Tooling can improve future research, but it does not itself improve the
+  current speed/WER gate. Adding a broad harness now would be infrastructure
+  work without a concrete optimization to keep or revert.
+
+Decision: **Rejected/deferred for current speed gate.** The existing benchmark
+scripts are sufficient for this round's keep/revert decisions. Add
+kernel-shape and parameter-sweep tooling later only when a specific candidate
+kernel/backend exposes measurable alternatives. No code change was made.
