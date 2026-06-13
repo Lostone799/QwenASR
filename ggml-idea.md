@@ -24,11 +24,7 @@ This file now keeps only methods that are not already checked by the documented 
 ## Scheduling, Batching, and Threading
 
 - Add graph/stage-level scheduling boundaries similar to whisper.cpp's separate conv, encoder, and cross/decoder schedulers. Existing code has explicit stages and profiling, but not a scheduler abstraction.
-- Add micro-batching for repeated decoder prefill work across independent utterances or streams.
-- Add batched decode across independent segments in segmented mode so each token step reads weights once for multiple segment states.
-- Add segment-level pipelining: encode segment N+1 while decoding segment N, using AMX-heavy encoder work and NEON-heavy decode work concurrently.
 - Add adaptive work partitioning thresholds based on measured shapes, choosing single-thread, thread-pool, BLAS, or custom kernels per operation.
-- Add CPU/AMX overlap pipelining inside the encoder/prefill path, running CPU-side ops such as im2col, softmax, norms, or activations while AMX GEMMs are in flight.
 
 ## Audio and ASR Pipeline
 

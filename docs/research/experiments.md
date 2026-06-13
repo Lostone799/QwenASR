@@ -1977,3 +1977,36 @@ Decision: **Rejected for current speed gate.** Existing encoder-window and
 partial-output caches address the expensive part of streaming reuse; mel
 caching is not worth the complexity at the measured cost. No code change was
 made.
+
+### G33: Multi-segment batching and pipeline scheduling
+
+Idea from `ggml-idea.md`:
+- Micro-batch repeated decoder prefill work across independent utterances or
+  streams.
+- Batch decode across independent segments so each token step reads weights
+  once for multiple segment states.
+- Pipeline segment execution by encoding segment N+1 while decoding segment N.
+- Overlap CPU-side encoder/prefill work with AMX-backed GEMMs.
+
+Audit:
+- `transcribe_audio`, `transcribe_segmented`, and streaming decode run through
+  one mutable `QwenCtx`.
+- `QwenCtx` owns the model, KV cache, decoder buffers, encoder cache,
+  alignment buffer, prompt state, and profiling state.
+- Batched independent utterances or segments need shared immutable weights plus
+  separate per-session KV caches and scratch buffers. Creating multiple full
+  `QwenCtx` values would duplicate the current multi-GB RSS footprint.
+- Segment-level pipelining needs at least separate encoder and decoder buffer
+  sets, and would risk oversubscribing the same CPU/AMX resources already used
+  by the current thread pool and Accelerate SGEMM calls.
+- Accelerate `cblas_sgemm` calls are synchronous in the current kernels; there
+  is no async BLAS handle that would let Rust-side im2col, softmax, norm, or
+  activation work be scheduled while a GEMM is still in flight.
+- The standard speed sample is about 28 seconds, and the current 100-file WER
+  gate uses short LibriSpeech utterances. These gates provide little or no
+  opportunity for multi-segment pipeline speedup.
+
+Decision: **Rejected/deferred for current speed gate.** These are plausible
+server or long-audio architecture projects, but they require a shared-weight /
+multi-session runtime split before they can be tested without large RSS growth.
+No code change was made.
