@@ -1641,3 +1641,15 @@ Audit:
 
 Decision: **Rejected for this round.** Core ML/ANE offload is too large and
 unvalidated for the current qwen-asr CPU speed gate. No code change was made.
+
+### G17: Narrow backend abstraction
+
+Idea from `ggml-idea.md`: keep any backend abstraction narrow: CPU,
+Accelerate/BNNS, and optional platform accelerator paths before considering a
+full ggml-style backend system.
+
+Decision: **Accepted as a design constraint, no code change.** The current
+round keeps the implementation on the existing CPU/Accelerate path and rejects
+platform backends that cannot beat or be validated against the local speed gate
+(G13-G16). A full ggml-style backend system would add dispatch, ownership, and
+testing complexity before a profitable non-CPU backend exists.
