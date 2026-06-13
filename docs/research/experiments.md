@@ -1873,3 +1873,25 @@ Audit:
 Decision: **Rejected for current speed work.** These are decoding-quality
 features, not speedups for the current greedy argmax path. No code change was
 made.
+
+### G28: Neural VAD and timestamp mapping for compacted audio
+
+Ideas from `ggml-idea.md`:
+- Replace or complement energy VAD with a neural VAD option.
+- Maintain a timestamp mapping table when VAD compacts audio so original-time
+  alignment is preserved after silence removal.
+
+Audit:
+- Current offline/streaming silence handling uses local RMS energy compaction
+  (`compact_silence` and `compact_silence_fast`) with no external model load.
+- Live `--vad` mode is also energy based.
+- The SRT/timestamped path `transcribe_segmented` explicitly preserves the
+  original audio timeline and does not compact silence, so its segment
+  `start_ms`/`end_ms` values remain accurate without a compaction map.
+- A neural VAD would add a new model/runtime dependency and its own threshold
+  calibration; it is primarily a quality/robustness feature, not a clear speed
+  win for the current LibriSpeech gate.
+
+Decision: **Rejected/deferred for this round.** Keep the zero-dependency energy
+VAD for the current speed path, and keep timestamped transcription on the
+uncompacted timeline. No code change was made.

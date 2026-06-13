@@ -32,8 +32,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Audio and ASR Pipeline
 
-- Replace or complement energy VAD with a neural VAD option, including configurable threshold, min speech, min silence, max speech duration, padding, and overlap.
-- Maintain a timestamp mapping table when VAD compacts audio so original-time alignment is preserved after silence removal.
 - Add adaptive chunk seek/advance for offline transcription based on decoded segment boundaries rather than only fixed windows.
 - Add explicit prompt history policies such as static initial prompt plus rolling recent-token context, with max prompt context and carry-initial-prompt controls.
 - Add DTW or cross-attention timestamp alignment as an optional forced-timestamp mode.
