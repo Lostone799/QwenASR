@@ -1914,3 +1914,25 @@ Decision: **Rejected for current speed work.** The existing forced-aligner path
 covers timestamp alignment use cases, and DTW/cross-attention would add runtime
 and memory rather than improve the current speed/WER gate. No code change was
 made.
+
+### G30: Explicit prompt history policies
+
+Idea from `ggml-idea.md`: add explicit prompt history policies such as static
+initial prompt plus rolling recent-token context, max prompt context, and
+carry-initial-prompt controls.
+
+Audit:
+- `QwenCtx` already supports static prompts via `set_prompt`.
+- The CLI exposes `--prompt`, `--language`, and `--past-text <yes|no|auto>`.
+- Segmented transcription can condition on accumulated past text when
+  `past_text_conditioning` is enabled.
+- Streaming keeps bounded carryover through `STREAM_RESET_CARRY_TOKENS` and
+  prefix-key reuse.
+- Additional knobs would mostly tune accuracy/continuity behavior and can add
+  prefill tokens, which increases decode/prefill work rather than improving the
+  current speed gate.
+
+Decision: **Rejected/no-op for current speed work.** Existing prompt and
+past-text controls cover the current modes; more policy surface should be driven
+by a quality requirement rather than this optimization pass. No code change was
+made.
