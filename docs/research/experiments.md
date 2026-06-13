@@ -1436,3 +1436,23 @@ Analysis:
 Decision: **Rejected for current speed gate.** The measurable upside is too
 small for the implementation and numeric-drift risk. No FFT code change was
 made.
+
+### G8: Record CPU feature flags in benchmark output
+
+Idea from `ggml-idea.md`: record CPU feature flags and selected kernels in
+benchmark output so kernel experiments can be compared across machines.
+
+Change:
+- `bench/run.sh` now writes a `system` object into each per-mode JSON result.
+- Recorded fields include OS, release, machine architecture, CPU brand, logical
+  CPU count, performance/efficiency core counts on macOS, and detected CPU
+  features such as NEON, DotProd, and I8MM.
+
+Validation:
+- `bench/run.sh --label round4-system-metadata --runs 1 --modes offline`
+  completed successfully.
+- Result JSON captured: Apple M5 Pro, 15 logical CPUs, 5 performance cores,
+  10 efficiency cores, and `NEON`, `DotProd`, `I8MM`.
+
+Decision: **Accepted as tooling.** This does not change inference speed, but it
+is directly useful for interpreting future SIMD/backend benchmark results.

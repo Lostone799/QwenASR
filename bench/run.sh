@@ -94,6 +94,55 @@ else
 fi
 
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SYSTEM_JSON="$(python3 - <<'PY'
+import json, os, platform, subprocess
+
+def sysctl(name):
+    try:
+        return subprocess.check_output(["sysctl", "-n", name], text=True).strip()
+    except Exception:
+        return ""
+
+machine = platform.machine()
+system = platform.system()
+features = []
+if machine == "arm64" or machine == "aarch64":
+    features.append("NEON")
+    if sysctl("hw.optional.arm.FEAT_DotProd") == "1":
+        features.append("DotProd")
+    if sysctl("hw.optional.arm.FEAT_I8MM") == "1":
+        features.append("I8MM")
+elif machine == "x86_64":
+    cpu_features = set()
+    if system == "Darwin":
+        cpu_features.update(sysctl("machdep.cpu.features").split())
+        cpu_features.update(sysctl("machdep.cpu.leaf7_features").split())
+    else:
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("flags"):
+                        cpu_features.update(line.split(":", 1)[1].split())
+                        break
+        except OSError:
+            pass
+    for name in ["avx", "avx2", "avx512f", "vnni", "amx_int8", "fma", "sse4_1"]:
+        if name.upper() in cpu_features or name in cpu_features:
+            features.append(name.upper())
+
+payload = {
+    "os": system,
+    "os_release": platform.release(),
+    "machine": machine,
+    "cpu_brand": sysctl("machdep.cpu.brand_string") or platform.processor(),
+    "logical_cpus": os.cpu_count() or 0,
+    "performance_cores": int(sysctl("hw.perflevel0.physicalcpu") or 0),
+    "efficiency_cores": int(sysctl("hw.perflevel1.physicalcpu") or 0),
+    "features": features,
+}
+print(json.dumps(payload))
+PY
+)"
 
 # Collect wav files
 WAV_FILES=()
@@ -303,6 +352,7 @@ data = {
     'file': sys.argv[5],
     'mode': sys.argv[6],
     'threads': int(sys.argv[7]),
+    'system': json.loads(sys.argv[27]),
     'config': {
         'segment_sec': int(sys.argv[8]),
         'model_dir': sys.argv[9],
@@ -338,7 +388,7 @@ with open(sys.argv[25], 'w', encoding='utf-8') as f:
             "$total_ms" "$encode_ms" "$decode_ms" "$tokens" "$tokens_per_sec" "$realtime_factor" \
             "$PROFILE_JSON" \
             "$WER" "$CER" "$LEV_WORDS" "$LEV_CHARS" "$EXACT" \
-            "$OUT_FILE" "$wall_ms"
+            "$OUT_FILE" "$wall_ms" "$SYSTEM_JSON"
 
         python3 - "$OUT_FILE" "$STATS_JSON" <<'PY'
 import json, sys
