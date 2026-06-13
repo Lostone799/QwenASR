@@ -8,7 +8,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 - Add group-wise low-bit decoder quantization, such as GPTQ/AWQ-style INT4 or ggml K-quant/IQ-style formats with small groups and zero-points. The documented E12 probe rejected naive per-row symmetric INT4, but not calibrated group-wise formats.
 - Quantize the encoder transformer and projection weights. Current experiments focus mainly on decoder INT8, decoder INT4, and prefill copies; encoder weight quantization remains unchecked.
-- Evaluate f16, bf16, q8, or lower-bit KV cache storage separately for K and V. Current KV cache is f32, and the experiments do not evaluate cache quantization.
 - Use mixed quantization by tensor role: keep sensitive tensors in f16/bf16/f32 and use lower-bit formats only for memory-bound FFN, projection, lm_head, or selected encoder matrices.
 - Repack quantized weights into SIMD-native interleaved layouts for formats beyond the current INT8 SDOT path. The I8MM/SMMLA experiment was checked and rejected, but block-quant layout work for Q4/Q5/K-quant-style kernels remains unchecked.
 - Consider per-layer or per-block activation quantization scales backed by offline calibration. The global static scale experiment failed; calibrated local scales remain a different method.
@@ -24,7 +23,6 @@ This file now keeps only methods that are not already checked by the documented 
 ## Attention and KV Cache
 
 - Evaluate true tiled flash-attention-style prefill for larger contexts. E8 accepted batched-GEMM prefill attention, but a memory-efficient tiled implementation remains a separate idea.
-- Add f16/bf16 or quantized KV storage with dequantization inside attention tiles.
 - Add KV cache slot, ring, or sliding-window management for streaming instead of only grow/reset behavior.
 - Add KV cache sequence copy/fork support for future beam search, best-of, or exact speculative verification.
 - Add cache defragmentation or compaction if future batching, beam search, or multi-session modes introduce holes.

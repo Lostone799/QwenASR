@@ -1481,3 +1481,34 @@ Decision: **Rejected.** The fused SGEMM accumulation path regressed every mode.
 Avoiding the temporary output and explicit add pass did not offset the cost of
 using the `beta=1.0` SGEMM path for these shapes. Code changes were fully
 reverted before running WER.
+
+### G10: f16/bf16/q8 KV cache storage
+
+Idea from `ggml-idea.md`: store decoder KV cache in f16, bf16, q8, or lower-bit
+formats, optionally dequantizing inside attention tiles.
+
+Audit:
+- `KvCache` stores K and V as `Vec<f32>` and exposes `*const f32` layer bases.
+- The single-token causal attention fast path scans K/V as f32 rows using
+  `dot_f32`, `vec_axpy_inplace`, and related f32 vector helpers.
+- The multi-token prefill attention path calls f32 `cblas_sgemm` directly over
+  the contiguous K and V cache rows.
+- A storage-only f16/bf16/q8 cache would therefore need to dequantize or convert
+  K/V back to f32 before the current attention kernels. That adds a full K/V
+  pass on the hot attention path and removes the intended bandwidth win.
+
+Current profile sample (`bench/run.sh --label round4-current-profile-g10
+--runs 3 --modes offline --profile`):
+
+| Counter | Time |
+|---------|-----:|
+| total inference | 446 ms |
+| `attention_causal_ms` | 25.0 ms |
+| `sgemm_ms` | 262.0 ms |
+| `conv2d_op_ms` | 73.1 ms |
+
+Decision: **Rejected for current kernels.** KV cache quantization is not a
+profitable storage-only change in the current architecture because all causal
+attention fast paths require f32 K/V inputs. It should only be reconsidered as
+part of a new attention kernel that consumes the compressed KV format directly.
+No code change was made.
