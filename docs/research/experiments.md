@@ -1620,3 +1620,24 @@ Decision: **Rejected for this round.** Existing Metal-family evidence is slower
 than the current CPU path, and implementing a native backend is too large for a
 speculative optimization without a clearer speed signal. No code change was
 made.
+
+### G16: Core ML or ANE encoder offload
+
+Idea from `ggml-idea.md`: evaluate Core ML or ANE encoder offload behind an
+optional feature.
+
+Audit:
+- The repository has no Core ML model export, `.mlmodel` artifact, or Core ML
+  runtime integration.
+- The current profile sample shows the encoder/prefill path is already dominated
+  by Accelerate-backed f32 GEMM (`sgemm_ms: 262.0`) and convolution
+  (`conv2d_op_ms: 73.1`) on the local Apple M5 Pro.
+- A Core ML/ANE path would require exporting and validating the encoder graph,
+  managing CPU/ANE tensor transfers, preserving numerics across the ASR WER
+  gate, and maintaining a CPU fallback.
+- Prior Metal-family backend comparisons are slower than the current CPU path,
+  which weakens the case for another framework/accelerator path without a
+  targeted prototype and a separate mobile/ANE benchmark gate.
+
+Decision: **Rejected for this round.** Core ML/ANE offload is too large and
+unvalidated for the current qwen-asr CPU speed gate. No code change was made.
