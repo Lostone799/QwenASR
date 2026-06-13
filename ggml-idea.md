@@ -56,7 +56,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 - Add mmap-backed packed weight cache or GGUF-style sidecar artifacts. A read-into-Vec cache was checked and rejected, but a zero-copy mmap-backed cache remains untested.
 - Add cache metadata that includes source tensor identity, CPU feature target, quantization format, packed layout, and kernel/cache version for any future derived artifacts.
-- Skip building unused weight copies per selected mode after auditing which modes truly need f32 prefill matrices.
 
 ## Backend and Accelerator Options
 

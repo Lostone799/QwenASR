@@ -1378,3 +1378,24 @@ Decision: **Rejected.** The vectorized fast-exp path regressed every mode. The
 extra function/kernel overhead on small per-thread gate/up chunks outweighed any
 benefit from SIMD approximation. Code changes were fully reverted before running
 WER.
+
+### G5: Skip unused f32 prefill weight copies per mode
+
+Idea from `ggml-idea.md`: audit which modes actually touch the f32 decoder
+prefill matrices and skip building unused copies for selected modes.
+
+Audit:
+- `QwenCtx::load(model_dir)` is the public constructor used by Rust, C FFI,
+  Flutter, and the CLI. Mode selection (`--stream`, `-S`, alignment, etc.)
+  happens after the context is loaded.
+- Offline transcription performs a decoder prefill.
+- Segmented transcription performs decoder prefill for each segment.
+- Streaming currently skips discarded non-final prefills, but the final chunk
+  still performs a decoder prefill.
+- Forced alignment uses prefill logits and also needs the prefill path.
+
+Decision: **Rejected/no-op.** Under the current API and benchmark modes there is
+no mode that can safely skip all f32 prefill matrices. Making this possible
+would require a new mode-specific loader or a larger lazy-load design, which is
+the already-rejected E3-style tradeoff unless paired with a different prefill
+backend. No code change was made.
