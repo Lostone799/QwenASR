@@ -210,18 +210,24 @@ for wav in "${WAV_FILES[@]}"; do
             STDERR_FILE="$(mktemp)"
 
             timing_line="$(python3 - "$STDOUT_FILE" "$STDERR_FILE" "${CMD[@]}" <<'PY'
-import subprocess, sys, time
+import platform, resource, subprocess, sys, time
 stdout_file, stderr_file = sys.argv[1:3]
 cmd = sys.argv[3:]
 with open(stdout_file, "wb") as so, open(stderr_file, "wb") as se:
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, stdout=so, stderr=se)
     t1 = time.perf_counter()
-print(f"rc={proc.returncode} wall_ms={(t1 - t0) * 1000:.1f}")
+rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+if platform.system() == "Darwin":
+    rss_kb = int(round(rss / 1024))
+else:
+    rss_kb = int(rss)
+print(f"rc={proc.returncode} wall_ms={(t1 - t0) * 1000:.1f} peak_rss_kb={rss_kb}")
 PY
 )"
             rc="$(echo "$timing_line" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
             this_wall="$(echo "$timing_line" | sed -n 's/.*wall_ms=\([0-9.]*\).*/\1/p')"
+            this_rss="$(echo "$timing_line" | sed -n 's/.*peak_rss_kb=\([0-9]*\).*/\1/p')"
 
             if [[ "$rc" != "0" ]]; then
                 echo "  FAILED (run $run_i)" >&2
@@ -235,7 +241,7 @@ PY
             if [[ -z "$this_total" ]]; then
                 rm -f "$STDOUT_FILE" "$STDERR_FILE"
             else
-                printf '%s\t%s\t%s\t%s\t%s\n' "$run_i" "$this_total" "$this_wall" "$STDOUT_FILE" "$STDERR_FILE" >>"$RUNS_TSV"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$run_i" "$this_total" "$this_wall" "${this_rss:-0}" "$STDOUT_FILE" "$STDERR_FILE" >>"$RUNS_TSV"
             fi
         done
 
@@ -251,11 +257,12 @@ import json, statistics, sys
 rows = []
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     for line in fh:
-        run_i, total_ms, wall_ms, stdout_file, stderr_file = line.rstrip("\n").split("\t")
+        run_i, total_ms, wall_ms, peak_rss_kb, stdout_file, stderr_file = line.rstrip("\n").split("\t")
         rows.append({
             "run": int(run_i),
             "total_ms": float(total_ms),
             "wall_ms": float(wall_ms),
+            "peak_rss_kb": int(peak_rss_kb),
             "stdout": stdout_file,
             "stderr": stderr_file,
         })
@@ -276,7 +283,19 @@ payload = {
         "mean_ms": statistics.fmean(row["wall_ms"] for row in rows),
         "best_ms": min(row["wall_ms"] for row in rows),
     },
-    "runs": [{"run": row["run"], "total_ms": row["total_ms"], "wall_ms": row["wall_ms"]} for row in rows],
+    "memory": {
+        "peak_rss_median_kb": int(statistics.median(row["peak_rss_kb"] for row in rows)),
+        "peak_rss_max_kb": max(row["peak_rss_kb"] for row in rows),
+    },
+    "runs": [
+        {
+            "run": row["run"],
+            "total_ms": row["total_ms"],
+            "wall_ms": row["wall_ms"],
+            "peak_rss_kb": row["peak_rss_kb"],
+        }
+        for row in rows
+    ],
 }
 print(json.dumps(payload))
 PY
@@ -356,6 +375,8 @@ data = {
     'config': {
         'segment_sec': int(sys.argv[8]),
         'model_dir': sys.argv[9],
+        'run_isolation': 'new_process_per_run',
+        'cache_state': 'os_page_cache_uncontrolled',
     },
     'audio_duration_s': float(sys.argv[10]),
     'transcript': sys.argv[11],
@@ -405,6 +426,8 @@ data["timing"]["inference_mean_ms"] = round(stats["inference"]["mean_ms"], 3)
 data["timing"]["inference_best_ms"] = round(stats["inference"]["best_ms"], 3)
 data["timing"]["wall_mean_ms"] = round(stats["wall"]["mean_ms"], 3)
 data["timing"]["wall_best_ms"] = round(stats["wall"]["best_ms"], 3)
+data["timing"]["peak_rss_median_kb"] = stats["memory"]["peak_rss_median_kb"]
+data["timing"]["peak_rss_max_kb"] = stats["memory"]["peak_rss_max_kb"]
 data["timing"]["runs"] = stats["runs"]
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2, ensure_ascii=False)

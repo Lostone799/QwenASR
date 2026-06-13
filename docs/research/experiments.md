@@ -1512,3 +1512,35 @@ profitable storage-only change in the current architecture because all causal
 attention fast paths require f32 K/V inputs. It should only be reconsidered as
 part of a new attention kernel that consumes the compressed KV format directly.
 No code change was made.
+
+### G11: Track peak RSS and cache-state metadata in benchmarks
+
+Idea from `ggml-idea.md`: track WER, CER, latency, realtime factor, peak RSS,
+load time, and cache warm/cold state for every optimization.
+
+Existing coverage before this check:
+- `bench/run.sh` already recorded WER, CER, wall-clock latency, inference
+  latency, realtime factor, per-run medians/best/means, and optional load-time
+  profile counters such as `model_load_ms`, `encoder_load_ms`, and
+  `decoder_load_ms`.
+- Round 4 G8 added CPU/system metadata.
+
+Change:
+- Added per-run child-process peak RSS capture using `getrusage`.
+- Normalized macOS `ru_maxrss` bytes to KiB, while preserving Linux's KiB unit.
+- Added `peak_rss_median_kb`, `peak_rss_max_kb`, and per-run `peak_rss_kb` to
+  the benchmark JSON timing object.
+- Added benchmark metadata documenting that each run uses a new process and
+  that the OS page-cache state is not controlled.
+
+Validation:
+- `bash -n bench/run.sh` passed.
+- `bench/run.sh --label round4-g11-rss-cache-metadata --runs 1 --modes offline`
+  completed successfully.
+- Result JSON recorded `peak_rss_median_kb: 6015216`,
+  `peak_rss_max_kb: 6015216`, `run_isolation: new_process_per_run`, and
+  `cache_state: os_page_cache_uncontrolled`.
+
+Decision: **Accepted as tooling.** This does not change inference speed, but it
+closes a benchmark observability gap needed to evaluate later quantization,
+cache, loader, and backend experiments.

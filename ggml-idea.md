@@ -65,7 +65,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 - Add kernel-shape benchmark tooling similar to llama-bench for matvec, GEMM, attention, conv, quantize, dequantize, lm_head argmax, and mel.
 - Add automated sweeps for chunk size, prefill batch size, quantization format, KV cache type, VAD aggressiveness, and backend choice.
-- Track WER, CER, latency, realtime factor, peak RSS, load time, and cache warm/cold state for every optimization.
 
 ## Conditional Ideas
 
