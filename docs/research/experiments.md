@@ -1456,3 +1456,28 @@ Validation:
 
 Decision: **Accepted as tooling.** This does not change inference speed, but it
 is directly useful for interpreting future SIMD/backend benchmark results.
+
+### G9: Fuse decoder prefill projection residual adds
+
+Idea from `ggml-idea.md`: add fused attention-output projection plus residual
+where activation lifetimes allow it.
+
+Change tested:
+- Replaced the decoder prefill attention output projection
+  `linear_nobias(proj_out, attn_out, wo)` plus `add_inplace(pref_x, proj_out)`
+  with the existing `linear_accumulate(pref_x, attn_out, wo, None, ...)`
+  helper, which calls SGEMM with `beta=1.0`.
+- Applied the same fusion to the prefill FFN down projection residual add.
+
+Results:
+
+| Mode | G3 inference | G9 inference | G3 wall | G9 wall |
+|------|-------------:|-------------:|--------:|--------:|
+| offline | 435 | 444 | 713 | 721 |
+| segmented -S30 | 318 | 330 | 597 | 603 |
+| streaming | 328 | 339 | 605 | 612 |
+
+Decision: **Rejected.** The fused SGEMM accumulation path regressed every mode.
+Avoiding the temporary output and explicit add pass did not offset the cost of
+using the `beta=1.0` SGEMM path for these shapes. Code changes were fully
+reverted before running WER.
