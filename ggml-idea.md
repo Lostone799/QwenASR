@@ -36,8 +36,6 @@ This file now keeps only methods that are not already checked by the documented 
 - Maintain a timestamp mapping table when VAD compacts audio so original-time alignment is preserved after silence removal.
 - Add adaptive chunk seek/advance for offline transcription based on decoded segment boundaries rather than only fixed windows.
 - Add explicit prompt history policies such as static initial prompt plus rolling recent-token context, with max prompt context and carry-initial-prompt controls.
-- Add temperature fallback or retry schedules for low-confidence decode.
-- Add optional beam search or best-of decoding with KV reuse.
 - Add DTW or cross-attention timestamp alignment as an optional forced-timestamp mode.
 - Cache mel windows incrementally for streaming input to avoid recomputing overlapping FFT/mel frames as audio arrives.
 

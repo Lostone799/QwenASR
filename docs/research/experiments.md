@@ -1850,3 +1850,26 @@ Audit:
 Decision: **Rejected/no-op for the current greedy decoder.** Reconsider only if
 beam/sampling or structured non-ASR output becomes an accepted feature. No code
 change was made.
+
+### G27: Temperature fallback, beam search, and best-of decoding
+
+Ideas from `ggml-idea.md`:
+- Temperature fallback or retry schedules for low-confidence decode.
+- Optional beam search or best-of decoding with KV reuse.
+
+Audit:
+- `decoder_forward` returns only the greedy argmax token.
+- The hot lm-head path uses `argmax_matvec_int8`/`argmax_matvec_bf16` without
+  materializing logits.
+- Temperature fallback, beam search, and best-of require logits or top-k
+  candidate sets, confidence scoring, multiple decode branches, and KV
+  copy/fork support.
+- These methods normally improve quality or robustness rather than speed; for
+  the current speed gate they would add extra lm-head and decoder work.
+- Prior vocabulary-shortlist experiments showed that restricting the argmax
+  search can break WER, so any non-greedy candidate pruning would need a new
+  quality pass.
+
+Decision: **Rejected for current speed work.** These are decoding-quality
+features, not speedups for the current greedy argmax path. No code change was
+made.
