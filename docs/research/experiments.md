@@ -1721,3 +1721,25 @@ Audit:
 Decision: **Rejected for current architecture.** Parallel long-audio
 segmentation needs a shared-weight/multi-session runtime first; adding it
 directly would likely regress load time and memory. No code change was made.
+
+### G21: Multi-session batching and daemon/server mode
+
+Ideas from `ggml-idea.md`:
+- Multi-session batching for server mode or batch transcription.
+- Daemon/server mode to amortize model load across repeated requests.
+
+Audit:
+- The public runtime is centered on `QwenCtx::load(model_dir)`, and each
+  `QwenCtx` owns both immutable model weights and mutable per-request state.
+- A daemon can amortize model load for repeated requests, but the current
+  benchmark gate is a single CLI transcription, so daemon residency would not
+  improve the measured speed path.
+- Multi-session batching needs shared immutable weights plus separate per-session
+  KV caches, decoder buffers, encoder buffers, prompt state, callbacks, and
+  performance counters.
+- Creating one full `QwenCtx` per request would duplicate the model and scratch
+  memory, worsening RSS and load behavior.
+
+Decision: **Rejected/deferred for this round.** Server residency and
+multi-session batching need a shared-weight/session-state split and a server or
+batch benchmark gate before they can be evaluated. No code change was made.
