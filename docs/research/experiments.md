@@ -1653,3 +1653,27 @@ round keeps the implementation on the existing CPU/Accelerate path and rejects
 platform backends that cannot beat or be validated against the local speed gate
 (G13-G16). A full ggml-style backend system would add dispatch, ownership, and
 testing complexity before a profitable non-CPU backend exists.
+
+### G18: Formal quantization calibration matrix
+
+Idea from `ggml-idea.md`: add a formal calibration matrix for quantization
+formats versus WER, CER, latency, memory, and load time.
+
+Matrix seeded from existing experiments:
+
+| Format / method | Tensor scope | Calibration | WER / CER | Latency | Memory / load | Decision |
+|-----------------|--------------|-------------|-----------|---------|---------------|----------|
+| INT8 per-row weights | decoder lm_head, FFN, attention decode weights | per-row weight scale | 100-file WER 0.0379 in accepted builds | accepted speed baseline | extra INT8 copies, offset by faster decode | accepted baseline |
+| INT4 naive symmetric | decoder decode weights | per-row symmetric, no GPTQ/AWQ | macro WER 0.2514, CER 0.1735 | not benchmarked after WER failure | expected lower memory bandwidth | rejected E12 |
+| Static INT8 activation scale | decoder activations | one global scale | speed-sample WER 1.0000; 100-file run timed out | invalid output | no useful memory/load benefit | rejected B10 |
+| INT8 prefill GEMM | decoder prefill weights | existing INT8 weight scale | expected WER unchanged, not implemented after compute audit | expected slower than Accelerate f32 AMX | could remove f32 prefill copies, but load already optimized | rejected E11 |
+| f16/bf16/q8 KV cache | decoder KV | storage-only, no attention-kernel calibration | not run; current kernels require f32 K/V | expected conversion overhead in attention | lower cache memory only | rejected G10 |
+| Group-wise GPTQ/AWQ/K-quant | decoder low-bit weights | offline group calibration required | unchecked | unchecked | potentially lower bandwidth/RSS | still pending as separate idea |
+| Per-layer/per-block activation scales | decoder activations | offline activation calibration required | unchecked | unchecked | no load benefit; possible quant precision gain | still pending as separate idea |
+| Mixed tensor-role quantization | selected sensitive vs memory-bound tensors | offline per-role matrix required | unchecked | unchecked | may trade memory bandwidth for WER | still pending as separate idea |
+| Encoder quantization | encoder transformer/projection | offline encoder calibration required | unchecked | unchecked | may reduce encoder RSS/load | still pending as separate idea |
+
+Decision: **Accepted as tooling/documentation.** The matrix makes the required
+WER/CER/latency/memory/load columns explicit and prevents confusing rejected
+cheap probes with still-unchecked calibrated quantization methods. No Rust code
+change was made.

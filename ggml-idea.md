@@ -11,7 +11,6 @@ This file now keeps only methods that are not already checked by the documented 
 - Use mixed quantization by tensor role: keep sensitive tensors in f16/bf16/f32 and use lower-bit formats only for memory-bound FFN, projection, lm_head, or selected encoder matrices.
 - Repack quantized weights into SIMD-native interleaved layouts for formats beyond the current INT8 SDOT path. The I8MM/SMMLA experiment was checked and rejected, but block-quant layout work for Q4/Q5/K-quant-style kernels remains unchecked.
 - Consider per-layer or per-block activation quantization scales backed by offline calibration. The global static scale experiment failed; calibrated local scales remain a different method.
-- Add a formal calibration matrix for quantization formats versus WER, CER, latency, memory, and load time.
 
 ## CPU Kernels
 
