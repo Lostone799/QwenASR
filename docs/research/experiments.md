@@ -1895,3 +1895,22 @@ Audit:
 Decision: **Rejected/deferred for this round.** Keep the zero-dependency energy
 VAD for the current speed path, and keep timestamped transcription on the
 uncompacted timeline. No code change was made.
+
+### G29: DTW or cross-attention timestamp alignment
+
+Idea from `ggml-idea.md`: add DTW or cross-attention timestamp alignment as an
+optional forced-timestamp mode.
+
+Audit:
+- The project already has a forced-alignment module using the aligner model's
+  timestamp tokens, with LIS/interpolation cleanup for monotonic timestamps.
+- The CLI exposes `--align`/`--align-language` for word-level timestamps.
+- DTW/cross-attention alignment is a timestamping/quality feature, not a speed
+  improvement for the current ASR transcription benchmark.
+- Adding it would require exposing or storing cross-attention matrices that are
+  not part of the current fast inference path.
+
+Decision: **Rejected for current speed work.** The existing forced-aligner path
+covers timestamp alignment use cases, and DTW/cross-attention would add runtime
+and memory rather than improve the current speed/WER gate. No code change was
+made.
