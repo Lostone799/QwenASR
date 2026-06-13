@@ -1936,3 +1936,22 @@ Decision: **Rejected/no-op for current speed work.** Existing prompt and
 past-text controls cover the current modes; more policy surface should be driven
 by a quality requirement rather than this optimization pass. No code change was
 made.
+
+### G31: Adaptive chunk seek/advance from decoded boundaries
+
+Idea from `ggml-idea.md`: add adaptive chunk seek/advance for offline
+transcription based on decoded segment boundaries rather than only fixed windows.
+
+Audit:
+- Current segmentation uses fixed target windows plus `find_split_point`, which
+  searches for the lowest-energy 100 ms window around the target cut.
+- The normal ASR transcription path does not emit reliable decoded timestamps or
+  word boundaries.
+- Timestamped output is handled through `transcribe_segmented` or the separate
+  forced-aligner path, not the fast text-only ASR path.
+- Driving chunk advance from decoded boundaries would require timestamp
+  generation/alignment first and a new long-audio quality gate.
+
+Decision: **Rejected/deferred for this round.** The current low-energy split
+search is cheap and already present; decoded-boundary seeking is a timestamping
+feature rather than a local speed optimization. No code change was made.

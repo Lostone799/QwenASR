@@ -32,7 +32,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Audio and ASR Pipeline
 
-- Add adaptive chunk seek/advance for offline transcription based on decoded segment boundaries rather than only fixed windows.
 - Cache mel windows incrementally for streaming input to avoid recomputing overlapping FFT/mel frames as audio arrives.
 
 ## Model Loading and Residency
