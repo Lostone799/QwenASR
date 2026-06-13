@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-cli-v0.7.0...qwen-asr-cli-v0.7.1) (2026-06-13)
+
+
+### Performance Improvements
+
+* add startup-phase profile breakdown (A6) ([8eba33f](https://github.com/huanglizhuo/QwenASR/commit/8eba33fb91003fcf65ef7474df412b5fd1ec66eb))
+* default thread count to performance cores (post-E8) ([44d6bad](https://github.com/huanglizhuo/QwenASR/commit/44d6bade14ca26fa2fa1daf2928cc0d579b45dc6))
+* overlap audio front-end loading with model load (A2) ([b219874](https://github.com/huanglizhuo/QwenASR/commit/b2198749cbcab80500e2a04d47a22679acbaac37))
+
 ## [0.7.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-cli-v0.6.0...qwen-asr-cli-v0.7.0) (2026-05-10)
 
 
