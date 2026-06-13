@@ -1578,3 +1578,21 @@ Decision: **Rejected for current target.** NNAPI/mobile encoder offload cannot
 improve the current macOS qwen-asr speed gate and cannot be validated without an
 Android device, Android model packaging, and a mobile WER/latency/RSS gate. No
 code change was made.
+
+### G14: Distributed or multi-device execution
+
+Idea from `ggml-idea.md`: distributed or multi-device execution only after CPU
+and single-device accelerator paths are exhausted.
+
+Audit:
+- Current accepted wins are still CPU-side, and several single-device backend
+  ideas remain unchecked.
+- Existing benchmark notes for MLX/Metal comparisons show GPU offload has not
+  yet beaten the local CPU path for this 0.6B model.
+- Distributed execution would add serialization, partitioning, synchronization,
+  and merge overhead before the project has a profitable single-device
+  accelerator path to distribute.
+
+Decision: **Rejected/deferred for this round.** This cannot improve the current
+single-machine qwen-asr speed gate before CPU and single-device accelerator
+paths are exhausted. No code change was made.

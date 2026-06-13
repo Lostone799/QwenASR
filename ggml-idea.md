@@ -71,4 +71,3 @@ This file now keeps only methods that are not already checked by the documented 
 - Multi-session batching for server mode or batch transcription.
 - Daemon/server mode to amortize model load across repeated requests.
 - Structured output grammar constraints if future non-greedy decoding is added.
-- Distributed or multi-device execution only after CPU and single-device accelerator paths are exhausted.
