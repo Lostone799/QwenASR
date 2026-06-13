@@ -1783,3 +1783,28 @@ Audit:
 Decision: **Rejected/deferred for this round.** A mmap-backed sidecar could only
 be evaluated after introducing a safe mapped-weight abstraction and cache format.
 No code change was made.
+
+### G24: KV slot/ring/copy/fork/defrag management
+
+Ideas from `ggml-idea.md`:
+- KV cache slot, ring, or sliding-window management for streaming.
+- KV cache sequence copy/fork support for future beam search, best-of, or exact
+  speculative verification.
+- Cache defragmentation or compaction if future batching, beam search, or
+  multi-session modes introduce holes.
+
+Audit:
+- Current `KvCache` is a dense append-only prefix with `len`, `max_seq`, and
+  contiguous `[layer][head][pos][head_dim]` storage.
+- Streaming already reuses a prefix by setting `ctx.kv_cache.len` to the longest
+  common prefill prefix before appending the delta.
+- Current decoding is greedy single-session; there is no beam, best-of,
+  speculative verification, multi-session batching, or sparse slot allocation.
+- Ring/sliding-window behavior would change attention context and therefore
+  needs an explicit long-context WER/latency gate, not the current short
+  LibriSpeech gate.
+
+Decision: **Rejected/no-op for the current path.** These KV-management features
+are future enablers, but they do not improve the current greedy single-session
+benchmark and would add indexing complexity to the hot attention path. No code
+change was made.

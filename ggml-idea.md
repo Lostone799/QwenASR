@@ -20,9 +20,6 @@ This file now keeps only methods that are not already checked by the documented 
 ## Attention and KV Cache
 
 - Evaluate true tiled flash-attention-style prefill for larger contexts. E8 accepted batched-GEMM prefill attention, but a memory-efficient tiled implementation remains a separate idea.
-- Add KV cache slot, ring, or sliding-window management for streaming instead of only grow/reset behavior.
-- Add KV cache sequence copy/fork support for future beam search, best-of, or exact speculative verification.
-- Add cache defragmentation or compaction if future batching, beam search, or multi-session modes introduce holes.
 
 ## Scheduling, Batching, and Threading
 
