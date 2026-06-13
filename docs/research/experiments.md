@@ -2091,3 +2091,28 @@ Decision: **Rejected/deferred for current speed gate.** The profitable part of
 flash-style prefill was already accepted in E8. A fully tiled implementation is
 not justified until larger-context benchmarks show attention memory traffic as
 a bottleneck. No code change was made.
+
+### G37: f16/bf16 GEMM through BNNS or AMX
+
+Idea from `ggml-idea.md`: evaluate f16 or bf16 GEMM through BNNS/AMX for encoder
+and decoder prefill, potentially removing or shrinking the f32 prefill copies.
+
+Audit:
+- Current encoder weights and decoder prefill weights are converted to f32 so
+  they can use Accelerate `cblas_sgemm`.
+- Single-token decode already consumes bf16 directly through custom NEON/AVX
+  matvec kernels, while multi-token paths convert bf16 to f32 before SGEMM.
+- E11 rejected hand-written INT8 prefill GEMM because prefill is compute-bound
+  and already runs through Apple's fast Accelerate/AMX f32 SGEMM path.
+- E3 and G5 showed that moving or skipping f32 prefill copies without a faster
+  multi-token backend mostly relocates conversion cost or creates an API split.
+- The repository has no BNNS binding layer today. A BNNS path would require new
+  tensor descriptors, layout checks, availability gating, f32 fallback, and WER
+  validation for every encoder/prefill matmul.
+- Without evidence that BNNS bf16/f16 beats the existing f32 SGEMM on this M5
+  Pro shape mix, the likely benefit is memory/RSS rather than speed.
+
+Decision: **Rejected/deferred for current speed gate.** This is a backend
+research project, not a local optimization. Reconsider only with a small BNNS
+microbenchmark proving better latency for the project’s actual matrix shapes.
+No code change was made.

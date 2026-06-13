@@ -26,8 +26,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Backend and Accelerator Options
 
-- Evaluate f16 or bf16 GEMM through BNNS/AMX for encoder and decoder prefill. This is distinct from rejected hand-written INT8 prefill GEMM and could remove or shrink f32 prefill copies.
-
 ## Profiling and Benchmarking
 
 - Add kernel-shape benchmark tooling similar to llama-bench for matvec, GEMM, attention, conv, quantize, dequantize, lm_head argmax, and mel.
