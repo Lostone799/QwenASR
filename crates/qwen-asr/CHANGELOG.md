@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.2](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-v0.7.1...qwen-asr-v0.7.2) (2026-06-13)
+
+
+### Performance Improvements
+
+* add startup-phase profile breakdown (A6) ([8eba33f](https://github.com/huanglizhuo/QwenASR/commit/8eba33fb91003fcf65ef7474df412b5fd1ec66eb))
+* batched GEMM prefill causal attention (E8) ([b2dac19](https://github.com/huanglizhuo/QwenASR/commit/b2dac19735828b11f97be3fb45e58f75678a55e6))
+* **decoder:** allocate hot decoder weights with 2 MB superpages ([1dd48aa](https://github.com/huanglizhuo/QwenASR/commit/1dd48aa844253fb7cd8d8bd07920392f085c0120))
+* **decoder:** allocate kv cache with superpages ([eee2396](https://github.com/huanglizhuo/QwenASR/commit/eee23969151fa5738a6ccbdf8bc45e13a6ddca75))
+* default thread count to performance cores (post-E8) ([44d6bad](https://github.com/huanglizhuo/QwenASR/commit/44d6bade14ca26fa2fa1daf2928cc0d579b45dc6))
+* parallelize model load conversions (E2) ([7a8ed02](https://github.com/huanglizhuo/QwenASR/commit/7a8ed024dda75fd93d960c2026a3601f907a9e18))
+* prefault mmap'd model weights with MADV_WILLNEED (A5) ([f1d3596](https://github.com/huanglizhuo/QwenASR/commit/f1d3596c84708b9f73a386b827aedcb0afef9e3a))
+
 ## [0.7.1](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-v0.7.0...qwen-asr-v0.7.1) (2026-05-14)
 
 
