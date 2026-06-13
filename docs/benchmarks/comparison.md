@@ -32,24 +32,24 @@ Output: `bench/compare-results/<timestamp>/` with `report.md`, `summary.json`, c
 ## Current qwen-asr HEAD
 
 > Generated on: 2026-06-13
-> Commit: `51d7726`
+> Commit: `7934c1b`
 > Runs: 10
 
 | Mode | Median inference ms | Mean ms | Best ms | Realtime factor |
 |---|---:|---:|---:|---:|
-| offline | 437 | 441.5 | 434 | 64.53× |
-| segmented | 324 | 324.5 | 320 | 87.04× |
-| streaming | 336 | 336.3 | 332 | 83.93× |
+| offline | 437 | 442.5 | 435 | 64.53× |
+| segmented | 326 | 327.3 | 323 | 86.50× |
+| streaming | 338 | 339.6 | 333 | 83.43× |
 
-Previous dedicated qwen-asr HEAD (`9ecde04`, recorded at `cd65501`):
+Previous `main` before merge (`cd65501`, corrected detached-worktree run):
 
 | Mode | Median inference ms | Mean ms | Best ms | Realtime factor |
 |---|---:|---:|---:|---:|
-| offline | 447 | 460.7 | 444 | 63.09× |
-| segmented | 336 | 337.0 | 333 | 83.93× |
-| streaming | 345 | 344.5 | 342 | 81.74× |
+| offline | 461 | 463.8 | 450 | 61.17× |
+| segmented | 347 | 346.5 | 336 | 81.27× |
+| streaming | 351 | 357.5 | 345 | 80.34× |
 
-Changes vs `cd65501`/`9ecde04`: −10 ms (−2.2%) offline, −12 ms (−3.6%) segmented, −9 ms (−2.6%) streaming inference; 100-file LibriSpeech offline WER unchanged at **0.0379**.
+Changes vs `cd65501`: −24 ms (−5.2%) offline, −21 ms (−6.1%) segmented, −13 ms (−3.7%) streaming inference; 100-file LibriSpeech offline WER unchanged at **0.0379**.
 
 See [`results.md`](./results.md) for the full speed-benchmark page.
 
@@ -63,19 +63,19 @@ See [`results.md`](./results.md) for the full speed-benchmark page.
 
 | Implementation | Commit / Version | Median inference ms | Mean ms | Best ms | RTF |
 |---|---:|---:|---:|---:|---:|
-| qwen-asr (latest) | `9ecde04` | 470 | 469 | 465 | 60.06× |
+| qwen-asr (latest full comparison) | `9ecde04` | 470 | 469 | 465 | 60.06× |
 | mlx-audio Python MLX | `0.4.4` | 674 | 688 | 669 | 41.79× |
 | second-state MLX GPU | `0226270` (v0.2.0) | 1,333 | 1,334 | 1,323 | 21.13× |
 | pure C upstream | `b00b789` | 1,610 | 1,612 | 1,598 | 17.50× |
 | qwen-asr (first) | `bf52daf` | 1,612 | 1,612 | 1,597 | 17.49× |
 
-> **Note:** cross-implementation runs use `--threads 15` (system CPU count) for every implementation, so qwen-asr latest here is 470 ms versus 447 ms in the dedicated speed benchmark which uses performance cores by default.
+> **Note:** this full cross-implementation run predates the `7934c1b` merge. The current dedicated qwen-asr benchmark is 437 ms offline / 64.53× RTF; rerun `bench/benchmark-all.sh` to refresh external-baseline charts and tables.
 
 ### Wall-clock timing
 
 | Implementation | Commit / Version | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |
 |---|---:|---:|---:|---:|---:|
-| qwen-asr (latest) | `9ecde04` | 859 | 896 | 851 | 32.83× |
+| qwen-asr (latest full comparison) | `9ecde04` | 859 | 896 | 851 | 32.83× |
 | second-state MLX GPU | `0226270` (v0.2.0) | 1,520 | 1,553 | 1,482 | 18.52× |
 | mlx-audio Python MLX | `0.4.4` | 1,703 | 1,773 | 1,673 | 16.54× |
 | pure C upstream | `b00b789` | 1,875 | 1,879 | 1,866 | 15.02× |
@@ -88,10 +88,10 @@ See [`results.md`](./results.md) for the full speed-benchmark page.
 
 ### Findings
 
-- qwen-asr latest `9ecde04` is **3.43×** faster than the initial Rust port `bf52daf`.
-- qwen-asr latest `9ecde04` is **3.43×** faster than the upstream pure C implementation.
-- qwen-asr latest `9ecde04` is **2.84×** faster than second-state MLX GPU (v0.2.0) by inference latency.
-- qwen-asr latest `9ecde04` is **1.44×** faster than mlx-audio Python MLX (v0.4.4) by inference latency.
+- In the latest full cross-implementation run, qwen-asr `9ecde04` is **3.43×** faster than the initial Rust port `bf52daf`.
+- In the latest full cross-implementation run, qwen-asr `9ecde04` is **3.43×** faster than the upstream pure C implementation.
+- In the latest full cross-implementation run, qwen-asr `9ecde04` is **2.84×** faster than second-state MLX GPU (v0.2.0) by inference latency.
+- In the latest full cross-implementation run, qwen-asr `9ecde04` is **1.44×** faster than mlx-audio Python MLX (v0.4.4) by inference latency.
 
 ## Why does pure CPU Rust beat GPU baselines?
 

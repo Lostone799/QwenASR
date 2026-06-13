@@ -8,11 +8,11 @@ Supports 0.6B and 1.7B models with offline, segmented, streaming, live capture, 
 
 ## Performance
 
-On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **470 ms** — about **60× faster than realtime**. It's faster than the upstream C implementation and the measured MLX GPU baselines.
+On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **437 ms** — about **64× faster than realtime** in the dedicated local benchmark. It's faster than the upstream C implementation and the measured MLX GPU baselines.
 
 | Implementation | Median inference | Realtime factor |
 |---|---:|---:|
-| qwen-asr (latest) | 470 ms | 60.06× |
+| qwen-asr (latest, dedicated) | 437 ms | 64.53× |
 | mlx-audio Python MLX | 674 ms | 41.79× |
 | second-state/qwen3_asr_rs MLX GPU | 1,333 ms | 21.13× |
 | pure C upstream | 1,610 ms | 17.50× |
@@ -23,7 +23,7 @@ On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **470 ms** �
   <img src="docs/benchmarks/charts/benchmark-unified-rtf.png" width="48%" alt="Realtime factor comparison" />
 </p>
 
-> Benchmarked on the same 28.2 s sample with 10 runs each. Latest qwen-asr uses all 15 CPU cores; the dedicated speed benchmark on performance cores reaches **447 ms / 63.09×**. See [`docs/benchmarks/comparison.md`](docs/benchmarks/comparison.md) for full details and reproduction steps.
+> Benchmarked on the same 28.2 s sample with 10 runs each. The qwen-asr latest row is the current dedicated benchmark at `7934c1b`; external baseline rows come from the latest full cross-implementation run. See [`docs/benchmarks/comparison.md`](docs/benchmarks/comparison.md) for full details and reproduction steps.
 
 ## Documentation
 

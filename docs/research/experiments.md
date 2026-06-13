@@ -2183,3 +2183,28 @@ Decision: **Rejected/deferred for current speed gate.** The existing benchmark
 scripts are sufficient for this round's keep/revert decisions. Add
 kernel-shape and parameter-sweep tooling later only when a specific candidate
 kernel/backend exposes measurable alternatives. No code change was made.
+
+### Round 4 final validation after merge to `main`
+
+After all `ggml-idea.md` items were checked, the branch was merged into `main`
+at `7934c1b`. A corrected detached-worktree benchmark compared the previous
+`main` (`cd65501`) against the merged result (`7934c1b`) with `bench/run.sh
+--runs 10`:
+
+| Mode | Previous `main` (`cd65501`) | Merged `main` (`7934c1b`) | Delta |
+|------|----------------------------:|--------------------------:|------:|
+| offline | 461 ms | 437 ms | -5.2% |
+| segmented | 347 ms | 326 ms | -6.1% |
+| streaming | 351 ms | 338 ms | -3.7% |
+
+The 100-file LibriSpeech offline WER gate is unchanged:
+
+| Metric | Previous `main` | Merged `main` |
+|--------|----------------:|--------------:|
+| Corpus WER | 0.0379 | 0.0379 |
+| Macro WER | 0.0418 | 0.0418 |
+| Corpus CER | 0.0152 | 0.0152 |
+
+Decision: **Validated after merge.** The merged `main` is faster than the
+previous `main` on all three benchmark modes with no WER regression. The
+temporary `ggml-idea.md` queue file was removed after all ideas were checked.

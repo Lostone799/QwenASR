@@ -37,24 +37,24 @@ Results are written to `bench/results/current/`.
 
 ### Latest Results
 
-> Generated on: 2026-06-12
-> Commit: `9ecde04`
+> Generated on: 2026-06-13
+> Commit: `7934c1b`
 > Hardware: Apple M5 Pro, 32 GB RAM
-> Threads: performance cores (5) — `bench/run.sh` reports the system CPU count (15) for metadata
+> Threads: default CLI thread policy; `bench/run.sh` reports the system CPU count (15) for metadata
 
 | Mode | Median inference ms | Mean ms | Best ms | Realtime factor | WER (sample) |
 |---|---:|---:|---:|---:|---:|
-| offline | 447 | 460.7 | 444 | 63.09× | 0.9189 |
-| segmented | 336 | 337.0 | 333 | 83.93× | 0.9189 |
-| streaming | 345 | 344.5 | 342 | 81.74× | 0.9189 |
+| offline | 437 | 442.5 | 435 | 64.53× | 0.9189 |
+| segmented | 326 | 327.3 | 323 | 86.50× | 0.9189 |
+| streaming | 338 | 339.6 | 333 | 83.43× | 0.9189 |
 
 #### Wall-clock timing
 
 | Mode | Median wall ms | Mean ms | Best ms | Wall realtime factor |
 |---|---:|---:|---:|---:|
-| offline | 816.9 | 917.7 | 811.4 | 34.55× |
-| segmented | 706.1 | 708.6 | 700.7 | 39.94× |
-| streaming | 716.8 | 716.5 | 712.7 | 39.34× |
+| offline | 705.7 | 760.9 | 703.2 | 39.96× |
+| segmented | 596.6 | 597.5 | 590.2 | 47.25× |
+| streaming | 607.1 | 612.3 | 600.7 | 46.45× |
 
 #### Note on sample WER
 
@@ -67,7 +67,7 @@ When run with `--profile`, the offline run reports per-kernel timings. The lates
 ### Historical context
 
 - Initial Rust port (`bf52daf`): 1,612 ms offline / 17.49× RTF (cross-implementation run, `--threads 15`)
-- Current implementation (`9ecde04`): 447 ms offline / 63.09× RTF (dedicated speed benchmark, performance cores)
+- Current implementation (`7934c1b`): 437 ms offline / 64.53× RTF (dedicated speed benchmark)
 
 See [`comparison.md`](./comparison.md) for the latest cross-implementation numbers and [`experiments.md`](../research/experiments.md) for the full optimization diaries.
 
@@ -130,8 +130,8 @@ python3 librispeech-wer-bench/librispeech_wer.py \
 
 ### Latest Results
 
-> Generated on: 2026-06-12
-> Commit: `9ecde04`
+> Generated on: 2026-06-13
+> Commit: `7934c1b`
 > Dataset: LibriSpeech `dev-clean-2`
 > Items evaluated: 100
 > Mode: offline
@@ -153,4 +153,3 @@ python3 librispeech-wer-bench/librispeech_wer.py \
 See [`experiments.md`](../research/experiments.md) for the full tuning diary.
 
 ---
-
