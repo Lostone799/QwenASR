@@ -55,7 +55,6 @@ This file now keeps only methods that are not already checked by the documented 
 ## Backend and Accelerator Options
 
 - Evaluate f16 or bf16 GEMM through BNNS/AMX for encoder and decoder prefill. This is distinct from rejected hand-written INT8 prefill GEMM and could remove or shrink f32 prefill copies.
-- Evaluate Apple Metal encoder/prefill offload behind an optional feature.
 - Evaluate Core ML or ANE encoder offload behind an optional feature.
 - Keep any backend abstraction narrow: CPU, Accelerate/BNNS, and optional platform accelerator paths before considering a full ggml-style backend system.
 

@@ -1596,3 +1596,27 @@ Audit:
 Decision: **Rejected/deferred for this round.** This cannot improve the current
 single-machine qwen-asr speed gate before CPU and single-device accelerator
 paths are exhausted. No code change was made.
+
+### G15: Apple Metal encoder/prefill offload
+
+Idea from `ggml-idea.md`: evaluate Apple Metal encoder/prefill offload behind
+an optional feature.
+
+Evidence:
+- Existing repo benchmark reports compare current qwen-asr against
+  second-state MLX Metal GPU and mlx-audio Python MLX.
+- `docs/benchmarks/comparison.md` records current CPU qwen-asr as **2.84x**
+  faster than second-state MLX GPU by inference latency and **1.44x** faster
+  than mlx-audio Python MLX.
+- The recorded cause is that the 0.6B model is too small to saturate the GPU;
+  Metal kernel launch overhead plus CPU/GPU transfer and framework overhead
+  dominate.
+- A native Metal backend would remove some framework overhead, but would still
+  need CPU/GPU residency management, encoder/prefill graph partitioning,
+  shader/toolchain work, and WER validation before it could beat the already
+  optimized CPU/Accelerate path.
+
+Decision: **Rejected for this round.** Existing Metal-family evidence is slower
+than the current CPU path, and implementing a native backend is too large for a
+speculative optimization without a clearer speed signal. No code change was
+made.
