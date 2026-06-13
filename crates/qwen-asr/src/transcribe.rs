@@ -134,8 +134,10 @@ fn transcribe_segment(
 
     // Mel spectrogram
     let t0 = get_time_ms();
-    let _pg = kernels::ProfileGuard::new(&kernels::PROF.mel_compute);
-    let (mel, mel_frames) = audio::mel_spectrogram(samples)?;
+    let (mel, mel_frames) = {
+        let _pg = kernels::ProfileGuard::new(&kernels::PROF.mel_compute);
+        audio::mel_spectrogram(samples)?
+    };
     let mel_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {

@@ -1399,3 +1399,40 @@ no mode that can safely skip all f32 prefill matrices. Making this possible
 would require a new mode-specific loader or a larger lazy-load design, which is
 the already-rejected E3-style tradeoff unless paired with a different prefill
 backend. No code change was made.
+
+### G6: Narrow `mel_compute` profiling scope
+
+While checking the vDSP FFT idea, profiling showed `mel_compute_ms` equal to the
+entire inference time. The `ProfileGuard` was created before
+`audio::mel_spectrogram(samples)?` but lived until the end of
+`transcribe_segment`, so it measured mel + encoder + decoder.
+
+Change:
+- Scoped the `mel_compute` profile guard to only the `audio::mel_spectrogram`
+  call.
+
+Corrected profile on the standard offline sample (`--profile`, runs=3):
+
+| Counter | Before | After |
+|---------|-------:|------:|
+| `mel_compute_ms` | 455.1 | 1.7 |
+
+Decision: **Accepted as tooling.** This does not change inference behavior, but
+it is required to fairly evaluate future mel/FFT work.
+
+### G7: vDSP FFT mel spectrogram rewrite
+
+Idea from `ggml-idea.md`: replace the dense DFT-based mel computation with a
+vDSP FFT path.
+
+Analysis:
+- After G6 fixed the profile scope, `mel_compute_ms` is only **1.7 ms** on the
+  standard 28 s speed sample after silence compaction.
+- The current DFT path is already batched through BLAS, and the dominant profile
+  buckets are encoder/decoder GEMMs and convolutions, not mel.
+- A vDSP real-FFT rewrite would need careful packed-spectrum handling and WER
+  validation for a sub-1% possible gain on the current gate.
+
+Decision: **Rejected for current speed gate.** The measurable upside is too
+small for the implementation and numeric-drift risk. No FFT code change was
+made.
