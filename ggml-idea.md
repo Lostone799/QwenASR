@@ -46,7 +46,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Model Loading and Residency
 
-- Add mmap-backed packed weight cache or GGUF-style sidecar artifacts. A read-into-Vec cache was checked and rejected, but a zero-copy mmap-backed cache remains untested.
 
 ## Backend and Accelerator Options
 

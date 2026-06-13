@@ -1762,3 +1762,24 @@ Audit:
 Decision: **Rejected/no-op for this round.** Revisit metadata only alongside a
 kept mmap-backed packed weight cache or calibrated quantized sidecar. No code
 change was made.
+
+### G23: mmap-backed packed weight cache or GGUF-style sidecar
+
+Idea from `ggml-idea.md`: add mmap-backed packed weight cache or GGUF-style
+sidecar artifacts. A read-into-Vec cache was checked and rejected, but a
+zero-copy mmap-backed cache remained untested.
+
+Audit:
+- A1 showed the owned-Vec cache was slower: warm-cache load ~437 ms versus
+  baseline model load ~249 ms, because it copied a ~3.2 GB derived cache.
+- The current decoder and encoder structs own generated f32 and INT8 buffers as
+  `Vec`s; many decoder hot buffers are deliberately superpage-aligned.
+- A zero-copy sidecar would need a new ownership type for either owned `Vec`
+  data or mmap-backed slices, plus alignment/version/CPU-feature validation and
+  lifetime coupling to the mapped file.
+- Replacing `Vec` ownership at all weight call sites is a broad loader and
+  kernel ABI change, not a small speed probe.
+
+Decision: **Rejected/deferred for this round.** A mmap-backed sidecar could only
+be evaluated after introducing a safe mapped-weight abstraction and cache format.
+No code change was made.
