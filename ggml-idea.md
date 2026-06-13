@@ -6,12 +6,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Quantization and Weight Layout
 
-- Add group-wise low-bit decoder quantization, such as GPTQ/AWQ-style INT4 or ggml K-quant/IQ-style formats with small groups and zero-points. The documented E12 probe rejected naive per-row symmetric INT4, but not calibrated group-wise formats.
-- Quantize the encoder transformer and projection weights. Current experiments focus mainly on decoder INT8, decoder INT4, and prefill copies; encoder weight quantization remains unchecked.
-- Use mixed quantization by tensor role: keep sensitive tensors in f16/bf16/f32 and use lower-bit formats only for memory-bound FFN, projection, lm_head, or selected encoder matrices.
-- Repack quantized weights into SIMD-native interleaved layouts for formats beyond the current INT8 SDOT path. The I8MM/SMMLA experiment was checked and rejected, but block-quant layout work for Q4/Q5/K-quant-style kernels remains unchecked.
-- Consider per-layer or per-block activation quantization scales backed by offline calibration. The global static scale experiment failed; calibrated local scales remain a different method.
-
 ## CPU Kernels
 
 ## Attention and KV Cache

@@ -1668,10 +1668,10 @@ Matrix seeded from existing experiments:
 | Static INT8 activation scale | decoder activations | one global scale | speed-sample WER 1.0000; 100-file run timed out | invalid output | no useful memory/load benefit | rejected B10 |
 | INT8 prefill GEMM | decoder prefill weights | existing INT8 weight scale | expected WER unchanged, not implemented after compute audit | expected slower than Accelerate f32 AMX | could remove f32 prefill copies, but load already optimized | rejected E11 |
 | f16/bf16/q8 KV cache | decoder KV | storage-only, no attention-kernel calibration | not run; current kernels require f32 K/V | expected conversion overhead in attention | lower cache memory only | rejected G10 |
-| Group-wise GPTQ/AWQ/K-quant | decoder low-bit weights | offline group calibration required | unchecked | unchecked | potentially lower bandwidth/RSS | still pending as separate idea |
-| Per-layer/per-block activation scales | decoder activations | offline activation calibration required | unchecked | unchecked | no load benefit; possible quant precision gain | still pending as separate idea |
-| Mixed tensor-role quantization | selected sensitive vs memory-bound tensors | offline per-role matrix required | unchecked | unchecked | may trade memory bandwidth for WER | still pending as separate idea |
-| Encoder quantization | encoder transformer/projection | offline encoder calibration required | unchecked | unchecked | may reduce encoder RSS/load | still pending as separate idea |
+| Group-wise GPTQ/AWQ/K-quant | decoder low-bit weights | offline group calibration required | not implemented after audit | requires new Q4/Q5/K-quant kernels | potentially lower bandwidth/RSS | deferred G38 |
+| Per-layer/per-block activation scales | decoder activations | offline activation calibration required | not implemented after audit | activation quant is not dominant | no load benefit; possible quant precision gain | deferred G38 |
+| Mixed tensor-role quantization | selected sensitive vs memory-bound tensors | offline per-role matrix required | not implemented after audit | requires per-role kernels/formats | may trade memory bandwidth for WER | deferred G38 |
+| Encoder quantization | encoder transformer/projection | offline encoder calibration required | not implemented after audit | current encoder/prefill uses f32 SGEMM | may reduce encoder RSS/load | deferred G38 |
 
 Decision: **Accepted as tooling/documentation.** The matrix makes the required
 WER/CER/latency/memory/load columns explicit and prevents confusing rejected
@@ -2116,3 +2116,38 @@ Decision: **Rejected/deferred for current speed gate.** This is a backend
 research project, not a local optimization. Reconsider only with a small BNNS
 microbenchmark proving better latency for the project’s actual matrix shapes.
 No code change was made.
+
+### G38: Remaining calibrated quantization formats
+
+Ideas from `ggml-idea.md`:
+- Group-wise low-bit decoder quantization such as GPTQ/AWQ-style INT4 or ggml
+  K-quant/IQ-style formats.
+- Encoder transformer/projection weight quantization.
+- Mixed quantization by tensor role, keeping sensitive tensors in higher
+  precision and lowering memory-bound tensors.
+- SIMD-native interleaved layouts for Q4/Q5/K-quant-style kernels.
+- Per-layer or per-block activation quantization scales from offline
+  calibration.
+
+Audit:
+- The accepted runtime quantization is decoder INT8 per-row weight quantization
+  for single-token decode, with f32 activations quantized dynamically per call.
+- E12 rejected naive per-row symmetric INT4 because WER rose far above the
+  gate. That result does not disprove calibrated group-wise formats, but it
+  does show that low-bit quantization is WER-sensitive for this model.
+- B10 rejected one global static activation scale because activation ranges
+  varied too widely; useful activation scales would need per-layer/per-block
+  calibration and validation.
+- Encoder and decoder prefill paths currently use f32 weights with Accelerate
+  SGEMM. Quantizing encoder/prefill weights without a faster backend would
+  either add dequantization before SGEMM or require new low-bit GEMM kernels.
+- Q4/Q5/K-quant/IQ formats are not storage-only changes. They require new
+  packing, calibration metadata, fused dequant-dot kernels, WER gates, and
+  benchmark tooling for each tensor role.
+- Mixed tensor-role quantization is a policy over those same calibrated formats;
+  without validated per-role candidates, there is nothing concrete to keep.
+
+Decision: **Rejected/deferred for current speed gate.** Do not implement another
+ad hoc quantization probe in this round. The next viable quantization step is a
+dedicated calibration program plus low-bit kernels and WER matrix, not a small
+runtime patch. No code change was made.
