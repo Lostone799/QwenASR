@@ -1808,3 +1808,26 @@ Decision: **Rejected/no-op for the current path.** These KV-management features
 are future enablers, but they do not improve the current greedy single-session
 benchmark and would add indexing complexity to the hot attention path. No code
 change was made.
+
+### G25: Streaming self-speculative and n-gram speculative decoding
+
+Ideas from `ggml-idea.md`:
+- Self-speculative streaming decode using the previous chunk transcript as an
+  exact verified draft.
+- N-gram speculative decoding from recent token history.
+
+Audit:
+- E13 already deferred speculative decoding because no Qwen3-ASR draft model
+  exists and ASR transcripts are not repetitive enough for generic n-gram
+  prompt-lookup speculation.
+- Previous streaming chunk transcripts are text outputs, while exact
+  verification would need token-level draft proposals that line up with the
+  current audio-conditioned decoder state.
+- The current streaming implementation already uses encoder-output/prefill LCP
+  reuse by resetting `ctx.kv_cache.len` to the matched prefix and only prefilling
+  the delta. That captures the exact reusable prefix without speculative
+  acceptance/rejection machinery.
+
+Decision: **Rejected/deferred.** These variants need a reliable draft-token
+source and an exact verification path; current streaming prefix reuse is the
+safe form already implemented. No code change was made.

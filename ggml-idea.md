@@ -55,6 +55,4 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Conditional Ideas
 
-- Self-speculative streaming decode using the previous chunk transcript as an exact verified draft. Generic draft-model speculative decoding was deferred for lack of a draft model, but this streaming-specific variant remains unchecked.
-- N-gram speculative decoding from recent token history if profiling shows repeated ASR continuations are common enough.
 - Structured output grammar constraints if future non-greedy decoding is added.
