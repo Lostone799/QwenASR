@@ -1831,3 +1831,22 @@ Audit:
 Decision: **Rejected/deferred.** These variants need a reliable draft-token
 source and an exact verification path; current streaming prefix reuse is the
 safe form already implemented. No code change was made.
+
+### G26: Structured output grammar constraints
+
+Idea from `ggml-idea.md`: structured output grammar constraints if future
+non-greedy decoding is added.
+
+Audit:
+- `decoder_forward` returns a single greedy argmax token.
+- The hot lm-head path is a fused INT8/BF16 argmax over the full vocabulary; it
+  does not materialize logits or candidate sets.
+- Grammar constraints are useful for sampling, beam search, or structured
+  output tasks, but the current ASR path is greedy text transcription.
+- Adding grammar filtering would either require a non-greedy decoder first or
+  restrict the argmax scan, which prior shortlist experiments showed can break
+  WER.
+
+Decision: **Rejected/no-op for the current greedy decoder.** Reconsider only if
+beam/sampling or structured non-ASR output becomes an accepted feature. No code
+change was made.

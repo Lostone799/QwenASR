@@ -54,5 +54,3 @@ This file now keeps only methods that are not already checked by the documented 
 - Add automated sweeps for chunk size, prefill batch size, quantization format, KV cache type, VAD aggressiveness, and backend choice.
 
 ## Conditional Ideas
-
-- Structured output grammar constraints if future non-greedy decoding is added.
