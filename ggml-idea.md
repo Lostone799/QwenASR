@@ -30,7 +30,6 @@ This file now keeps only methods that are not already checked by the documented 
 - Add micro-batching for repeated decoder prefill work across independent utterances or streams.
 - Add batched decode across independent segments in segmented mode so each token step reads weights once for multiple segment states.
 - Add segment-level pipelining: encode segment N+1 while decoding segment N, using AMX-heavy encoder work and NEON-heavy decode work concurrently.
-- Add long-audio parallel segmentation for offline transcription with merge and timestamp adjustment.
 - Add adaptive work partitioning thresholds based on measured shapes, choosing single-thread, thread-pool, BLAS, or custom kernels per operation.
 - Add CPU/AMX overlap pipelining inside the encoder/prefill path, running CPU-side ops such as im2col, softmax, norms, or activations while AMX GEMMs are in flight.
 

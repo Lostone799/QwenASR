@@ -1698,3 +1698,26 @@ Audit:
 Decision: **Rejected for this round.** Existing hot activation/softmax paths are
 already vectorized, and the one concrete remaining substitution regressed in G4.
 No code change was made.
+
+### G20: Long-audio parallel segmentation
+
+Idea from `ggml-idea.md`: add long-audio parallel segmentation for offline
+transcription with merge and timestamp adjustment.
+
+Audit:
+- `transcribe_audio` and `transcribe_segmented` run segments through one mutable
+  `QwenCtx`.
+- `QwenCtx` owns the loaded model, mmap lifetime, KV cache, decoder buffers,
+  encoder buffers, prompt state, performance counters, and optional callback.
+- Parallel segment workers would either need multiple full `QwenCtx` instances
+  or a larger refactor that splits immutable shared weights from per-session
+  mutable decode/encode state.
+- Multiple full contexts would duplicate the current multi-GB RSS footprint and
+  repeat model load work, which conflicts with the speed/RSS gate.
+- The current benchmark sample uses a long-audio token cap, and 100-file WER
+  gate utterances are short, so this would not improve the active validation
+  path without introducing a new long-file benchmark gate.
+
+Decision: **Rejected for current architecture.** Parallel long-audio
+segmentation needs a shared-weight/multi-session runtime first; adding it
+directly would likely regress load time and memory. No code change was made.
