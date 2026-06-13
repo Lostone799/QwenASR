@@ -1561,3 +1561,20 @@ Decision: **Rejected for current target.** An x86-only quantized kernel cannot
 improve or be validated against the current Apple/aarch64 qwen-asr speed gate.
 No code change was made. Reconsider on an x86 benchmark host with a matching
 WER gate and CPU feature metadata.
+
+### G13: Android NNAPI/mobile encoder offload
+
+Idea from `ggml-idea.md`: evaluate Android NNAPI or other mobile encoder-only
+offload paths behind optional features.
+
+Audit:
+- Current benchmark host is macOS `arm64`, not Android.
+- The repository includes Android/JNI packaging support, but no NNAPI encoder
+  backend implementation.
+- The current speed/WER gate is the local Apple M5 Pro CLI benchmark; an
+  Android-only accelerator path cannot run or be measured here.
+
+Decision: **Rejected for current target.** NNAPI/mobile encoder offload cannot
+improve the current macOS qwen-asr speed gate and cannot be validated without an
+Android device, Android model packaging, and a mobile WER/latency/RSS gate. No
+code change was made.
