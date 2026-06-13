@@ -32,7 +32,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Audio and ASR Pipeline
 
-- Cache mel windows incrementally for streaming input to avoid recomputing overlapping FFT/mel frames as audio arrives.
 
 ## Model Loading and Residency
 

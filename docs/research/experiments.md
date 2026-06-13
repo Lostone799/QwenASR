@@ -1955,3 +1955,25 @@ Audit:
 Decision: **Rejected/deferred for this round.** The current low-energy split
 search is cheap and already present; decoded-boundary seeking is a timestamping
 feature rather than a local speed optimization. No code change was made.
+
+### G32: Incremental streaming mel-window cache
+
+Idea from `ggml-idea.md`: cache mel windows incrementally for streaming input to
+avoid recomputing overlapping FFT/mel frames as audio arrives.
+
+Audit:
+- Streaming already caches completed encoder windows (`enc_cache`) and their
+  prefill row keys.
+- Incremental streaming state already lazily reuses partial encoder output and
+  skips re-encoding on intermediate chunks when possible.
+- After G6 fixed the profile scope, mel computation on the standard sample is
+  only about **1.7 ms**; G7 rejected a vDSP FFT rewrite because the measurable
+  upside was too small.
+- A mel-window cache would add indexing and invalidation complexity for a tiny
+  remaining cost, while the dominant streaming work is encoder/decoder and
+  prefill/decode.
+
+Decision: **Rejected for current speed gate.** Existing encoder-window and
+partial-output caches address the expensive part of streaming reuse; mel
+caching is not worth the complexity at the measured cost. No code change was
+made.
