@@ -16,7 +16,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 - Add tiny-shape specialized kernels for common qwen-asr dimensions where BLAS/custom-kernel crossover points are known from benchmarks.
 - Add fused dequantize-dot-accumulate kernels for future low-bit formats so dequantized f32 blocks are not materialized.
-- Add lookup-table or polynomial approximations for remaining hot scalar functions beyond existing kernels. The single-token INT8 SwiGLU scalar-to-NEON fast-exp path was checked and rejected in Round 4 G4.
 
 ## Attention and KV Cache
 

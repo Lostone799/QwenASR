@@ -1677,3 +1677,24 @@ Decision: **Accepted as tooling/documentation.** The matrix makes the required
 WER/CER/latency/memory/load columns explicit and prevents confusing rejected
 cheap probes with still-unchecked calibrated quantization methods. No Rust code
 change was made.
+
+### G19: Remaining lookup-table or polynomial approximations
+
+Idea from `ggml-idea.md`: add lookup-table or polynomial approximations for
+remaining hot scalar functions beyond existing kernels.
+
+Audit:
+- GELU already dispatches to NEON/AVX fast approximations.
+- Prefill SwiGLU already dispatches to NEON/AVX `swiglu_interleaved`.
+- Generic softmax uses Accelerate `vvexpf` on macOS.
+- Round 4 G4 tested replacing the remaining single-token INT8 SwiGLU scalar
+  path with the NEON fast-exp path and regressed every benchmark mode.
+- The remaining scalar exponentials in the current macOS path are mainly the
+  online single-token causal-attention recurrence. That path is only part of
+  `attention_causal_ms` (25.0 ms in a 446 ms inference profile) and is coupled
+  to exact softmax recurrence state, so an approximation risks WER for a small
+  speed target.
+
+Decision: **Rejected for this round.** Existing hot activation/softmax paths are
+already vectorized, and the one concrete remaining substitution regressed in G4.
+No code change was made.
