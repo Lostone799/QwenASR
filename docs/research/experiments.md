@@ -1544,3 +1544,20 @@ Validation:
 Decision: **Accepted as tooling.** This does not change inference speed, but it
 closes a benchmark observability gap needed to evaluate later quantization,
 cache, loader, and backend experiments.
+
+### G12: x86 quantized kernels
+
+Idea from `ggml-idea.md`: add x86 quantized kernels for INT8 and future low-bit
+formats, including AVX2, AVX512, VNNI, or AMX paths.
+
+Audit:
+- Current benchmark host: `arm64`, Rust host `aarch64-apple-darwin`.
+- The speed/WER gate for this round is the local Apple M5 Pro benchmark.
+- The repository already has an `avx.rs` module for several x86 f32/bf16 helper
+  kernels, but the unchecked idea is specifically x86 quantized INT8/low-bit
+  kernels.
+
+Decision: **Rejected for current target.** An x86-only quantized kernel cannot
+improve or be validated against the current Apple/aarch64 qwen-asr speed gate.
+No code change was made. Reconsider on an x86 benchmark host with a matching
+WER gate and CPU feature metadata.
