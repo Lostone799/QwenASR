@@ -2010,3 +2010,33 @@ Decision: **Rejected/deferred for current speed gate.** These are plausible
 server or long-audio architecture projects, but they require a shared-weight /
 multi-session runtime split before they can be tested without large RSS growth.
 No code change was made.
+
+### G34: Graph scheduler abstraction and adaptive work thresholds
+
+Idea from `ggml-idea.md`:
+- Add graph/stage-level scheduling boundaries similar to whisper.cpp's separate
+  conv, encoder, cross-attention, and decoder schedulers.
+- Add adaptive operation thresholds that choose single-thread, thread-pool,
+  BLAS, or custom kernels from measured shapes.
+
+Audit:
+- The current runtime already has explicit stage boundaries in transcription,
+  decoder prefill, decoder forward, encoder, and kernel profiling counters.
+- Several kernel decisions are already shape-gated: convolution parallelizes
+  im2col when `patch_size >= 16`, GELU/SwiGLU parallelize above 4096 elements,
+  attention parallelizes by head count, causal attention uses a single-token
+  online path and a multi-token BLAS path, and prefill matmul routes through
+  Accelerate SGEMM.
+- Round 3 D1 tested per-phase thread caps for bandwidth-bound decode kernels.
+  Results were mixed and within run noise: some modes improved while others
+  regressed, so the added dispatch complexity was reverted.
+- A graph scheduler by itself does not make an individual operation faster.
+  It becomes useful only after there are concrete alternate kernels or measured
+  shape thresholds that beat the current direct dispatch.
+- The remaining profiling item for kernel-shape benchmarks is still unchecked;
+  without that data, new adaptive thresholds would be guesswork.
+
+Decision: **Rejected/deferred for current speed gate.** Keep the current direct
+stage calls and existing shape gates. Revisit scheduler abstractions only after
+kernel-shape benchmark tooling identifies specific profitable crossovers. No
+code change was made.

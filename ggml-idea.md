@@ -23,9 +23,6 @@ This file now keeps only methods that are not already checked by the documented 
 
 ## Scheduling, Batching, and Threading
 
-- Add graph/stage-level scheduling boundaries similar to whisper.cpp's separate conv, encoder, and cross/decoder schedulers. Existing code has explicit stages and profiling, but not a scheduler abstraction.
-- Add adaptive work partitioning thresholds based on measured shapes, choosing single-thread, thread-pool, BLAS, or custom kernels per operation.
-
 ## Audio and ASR Pipeline
 
 
