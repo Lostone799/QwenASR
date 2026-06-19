@@ -7,22 +7,33 @@ use crate::safetensors::MultiSafetensors;
 const SUPERPAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// Allocate a zeroed Vec backed by superpage-aligned memory.
-/// On Apple Silicon this makes it possible for the kernel to use 2 MB pages
-/// for the large INT8/f32 weight buffers, reducing TLB pressure during the
-/// ~500 MB/token decode read stream. Falls back to a normal Vec on failure.
+/// On Unix this uses `posix_memalign` with 2 MB alignment so the kernel can use
+/// 2 MB pages, reducing TLB pressure during the ~500 MB/token decode read stream.
+/// On Windows this uses `_aligned_malloc`. Falls back to a normal Vec on failure.
 fn superpage_vec<T: Copy>(n: usize) -> Vec<T> {
     let size = n.checked_mul(std::mem::size_of::<T>()).unwrap_or(0);
     if size < SUPERPAGE_SIZE {
         return vec![unsafe { std::mem::zeroed() }; n];
     }
-    let mut ptr = std::ptr::null_mut();
-    let rc = unsafe { libc::posix_memalign(&mut ptr, SUPERPAGE_SIZE, size) };
-    if rc != 0 || ptr.is_null() {
-        return vec![unsafe { std::mem::zeroed() }; n];
+    #[cfg(unix)]
+    {
+        let mut ptr = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut ptr, SUPERPAGE_SIZE, size) };
+        if rc != 0 || ptr.is_null() {
+            return vec![unsafe { std::mem::zeroed() }; n];
+        }
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+            Vec::from_raw_parts(ptr as *mut T, n, n)
+        }
     }
-    unsafe {
-        std::ptr::write_bytes(ptr, 0, size);
-        Vec::from_raw_parts(ptr as *mut T, n, n)
+    #[cfg(windows)]
+    {
+        // On Windows, Vec::from_raw_parts with aligned_malloc causes heap corruption
+        // because Vec's drop calls Rust's allocator (HeapFree), not aligned_free.
+        // Since INT8 superpage-aligned kernels are aarch64-only anyway, just use
+        // standard Vec allocation on Windows/x86_64.
+        vec![unsafe { std::mem::zeroed() }; n]
     }
 }
 
@@ -32,11 +43,213 @@ fn quantize_to_superpage(
     w_bf16: *const u16,
     out_dim: usize,
     in_dim: usize,
-) -> (Vec<i8>, Vec<f32>) {
-    let (int8, scales) = kernels::quantize_bf16_weights_to_int8(w_bf16, out_dim, in_dim);
+) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
+    let (int8, scales, w_sums) = kernels::quantize_bf16_weights_to_int8(w_bf16, out_dim, in_dim);
     let mut sp = superpage_vec::<i8>(int8.len());
     sp.copy_from_slice(&int8);
-    (sp, scales)
+    (sp, scales, w_sums)
+}
+
+// ========================================================================
+// INT8 Cache: pre-computed quantization results to skip re-quantization
+// ========================================================================
+
+const INT8_CACHE_MAGIC: [u8; 4] = *b"QI8C";
+const INT8_CACHE_VERSION: u32 = 1;
+
+/// Pre-computed INT8 quantization cache.
+/// Stores all decoder layer INT8 weights + lm_head INT8 weights.
+/// On load, if cache exists and config matches, skip quantization entirely.
+pub struct Int8Cache {
+    /// [layer][weight_index] -> (int8, scales, sums)
+    /// weight_index: 0=wq, 1=wk, 2=wv, 3=wo, 4=gate_up, 5=down
+    layer_weights: Vec<[(Vec<i8>, Vec<f32>, Vec<i32>); 6]>,
+    /// lm_head: (int8, scales, sums)
+    lm_head: (Vec<i8>, Vec<f32>, Vec<i32>),
+    /// Config hash for validation on load
+    config_hash: u64,
+}
+
+impl Int8Cache {
+    /// Compute a hash from config to validate cache compatibility.
+    fn config_hash(cfg: &QwenConfig) -> u64 {
+        let mut h: u64 = 0;
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_layers as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_hidden as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_heads as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_head_dim as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_kv_heads as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.dec_intermediate as u64);
+        h = h.wrapping_mul(31).wrapping_add(cfg.lm_head_dim() as u64);
+        h
+    }
+
+    /// Try to load cache from file. Returns None if file doesn't exist or is invalid.
+    pub fn load(path: &str, cfg: &QwenConfig) -> Option<Self> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut buf = vec![0u8; 4 + 4 + 4 + 8]; // magic(4) + version(4) + n_layers(4) + config_hash(8) = 20
+        file.read_exact(&mut buf).ok()?;
+
+        if &buf[0..4] != &INT8_CACHE_MAGIC {
+            return None;
+        }
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != INT8_CACHE_VERSION {
+            return None;
+        }
+        let n_layers = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let config_hash = u64::from_le_bytes(buf[12..20].try_into().ok()?);
+
+        if n_layers != cfg.dec_layers || config_hash != Self::config_hash(cfg) {
+            return None;
+        }
+
+        let mut reader = std::io::BufReader::new(file);
+
+        let mut layer_weights = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let layer: [(Vec<i8>, Vec<f32>, Vec<i32>); 6] = std::array::from_fn(|_| {
+                read_int8_weight(&mut reader).unwrap_or_default()
+            });
+            layer_weights.push(layer);
+        }
+
+        let lm_head = read_int8_weight(&mut reader)?;
+
+        if kernels::verbose() >= 1 {
+            eprintln!("Loaded INT8 cache from {}", path);
+        }
+
+        Some(Int8Cache { layer_weights, lm_head, config_hash })
+    }
+
+    /// Get a specific layer's INT8 weight by index.
+    /// weight_index: 0=wq, 1=wk, 2=wv, 3=wo, 4=gate_up, 5=down
+    pub fn get_layer_weight(&self, layer: usize, weight_index: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
+        let (int8, scales, sums) = &self.layer_weights[layer][weight_index];
+        (int8.clone(), scales.clone(), sums.clone())
+    }
+
+    /// Get lm_head INT8 weight.
+    pub fn get_lm_head_weight(&self) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
+        let (int8, scales, sums) = &self.lm_head;
+        (int8.clone(), scales.clone(), sums.clone())
+    }
+
+    /// Save cache to file.
+    pub fn save(&self, path: &str) -> Option<()> {
+        use std::io::{Write, BufWriter};
+
+        let file = std::fs::File::create(path).ok()?;
+        let mut w = BufWriter::new(file);
+
+        // Header
+        w.write_all(&INT8_CACHE_MAGIC).ok()?;
+        w.write_all(&INT8_CACHE_VERSION.to_le_bytes()).ok()?;
+        w.write_all(&(self.layer_weights.len() as u32).to_le_bytes()).ok()?;
+        w.write_all(&self.config_hash.to_le_bytes()).ok()?;
+
+        // Per-layer data
+        for layer in &self.layer_weights {
+            for weight in layer {
+                write_int8_weight(&mut w, weight)?;
+            }
+        }
+
+        // LM head
+        write_int8_weight(&mut w, &self.lm_head)?;
+
+        w.flush().ok()?;
+        if kernels::verbose() >= 1 {
+            eprintln!("Saved INT8 cache to {}", path);
+        }
+        Some(())
+    }
+}
+
+/// Read one INT8 weight (out_dim, in_dim, int8_data, scales, sums) from reader.
+fn read_int8_weight<R: std::io::Read>(reader: &mut R) -> Option<(Vec<i8>, Vec<f32>, Vec<i32>)> {
+    let mut hdr = [0u8; 8];
+    reader.read_exact(&mut hdr).ok()?;
+    let out_dim = u32::from_le_bytes(hdr[0..4].try_into().ok()?) as usize;
+    let in_dim = u32::from_le_bytes(hdr[4..8].try_into().ok()?) as usize;
+    let total = out_dim.checked_mul(in_dim)?;
+
+    let mut int8 = vec![0i8; total];
+    let mut int8_bytes = vec![0u8; total];
+    reader.read_exact(&mut int8_bytes).ok()?;
+    for (i, &b) in int8_bytes.iter().enumerate() {
+        int8[i] = b as i8;
+    }
+
+    let mut scales = vec![0f32; out_dim];
+    let mut scales_bytes = vec![0u8; out_dim * 4];
+    reader.read_exact(&mut scales_bytes).ok()?;
+    for i in 0..out_dim {
+        scales[i] = f32::from_le_bytes(scales_bytes[i*4..i*4+4].try_into().ok()?);
+    }
+
+    let mut sums = vec![0i32; out_dim];
+    let mut sums_bytes = vec![0u8; out_dim * 4];
+    reader.read_exact(&mut sums_bytes).ok()?;
+    for i in 0..out_dim {
+        sums[i] = i32::from_le_bytes(sums_bytes[i*4..i*4+4].try_into().ok()?);
+    }
+
+    Some((int8, scales, sums))
+}
+
+/// Write one INT8 weight to writer.
+fn write_int8_weight<W: std::io::Write>(w: &mut W, weight: &(Vec<i8>, Vec<f32>, Vec<i32>)) -> Option<()> {
+    let (int8, scales, sums) = weight;
+    let out_dim = scales.len();
+    let in_dim = if out_dim > 0 { int8.len() / out_dim } else { 0 };
+
+    w.write_all(&(out_dim as u32).to_le_bytes()).ok()?;
+    w.write_all(&(in_dim as u32).to_le_bytes()).ok()?;
+
+    // Write int8 data as bytes
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(int8.as_ptr() as *const u8, int8.len()) };
+    w.write_all(bytes).ok()?;
+
+    // Write scales
+    for s in scales {
+        w.write_all(&s.to_le_bytes()).ok()?;
+    }
+
+    // Write sums
+    for s in sums {
+        w.write_all(&s.to_le_bytes()).ok()?;
+    }
+
+    Some(())
+}
+
+impl Decoder {
+    /// Build Int8Cache from loaded decoder layers + lm_head.
+    fn build_cache(layers: &[DecLayer], lm_int8: &Vec<i8>, lm_scales: &Vec<f32>, lm_sums: &Vec<i32>, cfg: &QwenConfig) -> Option<Int8Cache> {
+        let mut layer_weights = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let w: [(Vec<i8>, Vec<f32>, Vec<i32>); 6] = std::array::from_fn(|idx| {
+                match idx {
+                    0 => (layer.wq_int8.clone(), layer.wq_int8_scales.clone(), layer.wq_int8_sums.clone()),
+                    1 => (layer.wk_int8.clone(), layer.wk_int8_scales.clone(), layer.wk_int8_sums.clone()),
+                    2 => (layer.wv_int8.clone(), layer.wv_int8_scales.clone(), layer.wv_int8_sums.clone()),
+                    3 => (layer.wo_int8.clone(), layer.wo_int8_scales.clone(), layer.wo_int8_sums.clone()),
+                    4 => (layer.gate_up_int8.clone(), layer.gate_up_int8_scales.clone(), layer.gate_up_int8_sums.clone()),
+                    _ => (layer.down_int8.clone(), layer.down_int8_scales.clone(), layer.down_int8_sums.clone()),
+                }
+            });
+            layer_weights.push(w);
+        }
+        Some(Int8Cache {
+            layer_weights,
+            lm_head: (lm_int8.clone(), lm_scales.clone(), lm_sums.clone()),
+            config_hash: Int8Cache::config_hash(cfg),
+        })
+    }
 }
 
 pub struct DecLayer {
@@ -44,10 +257,10 @@ pub struct DecLayer {
     pub wk_weight_bf16: *const u16,
     pub wv_weight_bf16: *const u16,
     pub wo_weight_bf16: *const u16,
-    pub wq_weight_f32_prefill: Vec<f32>,
-    pub wk_weight_f32_prefill: Vec<f32>,
-    pub wv_weight_f32_prefill: Vec<f32>,
-    pub wo_weight_f32_prefill: Vec<f32>,
+    pub wq_weight_f32_prefill: Option<Vec<f32>>,
+    pub wk_weight_f32_prefill: Option<Vec<f32>>,
+    pub wv_weight_f32_prefill: Option<Vec<f32>>,
+    pub wo_weight_f32_prefill: Option<Vec<f32>>,
     pub q_norm_weight: Vec<f32>,
     pub k_norm_weight: Vec<f32>,
     pub input_norm: Vec<f32>,
@@ -56,22 +269,28 @@ pub struct DecLayer {
     pub up_weight_bf16: *const u16,
     pub down_weight_bf16: *const u16,
     pub gate_up_fused_bf16: Vec<u16>, // owned, interleaved
-    pub gate_up_fused_f32_prefill: Vec<f32>,
-    pub down_weight_f32_prefill: Vec<f32>,
-    /// INT8 quantized attention weights + per-row scales
+    pub gate_up_fused_f32_prefill: Option<Vec<f32>>,
+    pub down_weight_f32_prefill: Option<Vec<f32>>,
+    /// INT8 quantized attention weights + per-row scales + per-row w_sums
     pub wq_int8: Vec<i8>,
     pub wq_int8_scales: Vec<f32>,
+    pub wq_int8_sums: Vec<i32>,
     pub wk_int8: Vec<i8>,
     pub wk_int8_scales: Vec<f32>,
+    pub wk_int8_sums: Vec<i32>,
     pub wv_int8: Vec<i8>,
     pub wv_int8_scales: Vec<f32>,
+    pub wv_int8_sums: Vec<i32>,
     pub wo_int8: Vec<i8>,
     pub wo_int8_scales: Vec<f32>,
-    /// INT8 quantized FFN weights + per-row scales
+    pub wo_int8_sums: Vec<i32>,
+    /// INT8 quantized FFN weights + per-row scales + per-row w_sums
     pub gate_up_int8: Vec<i8>,
     pub gate_up_int8_scales: Vec<f32>,
+    pub gate_up_int8_sums: Vec<i32>,
     pub down_int8: Vec<i8>,
     pub down_int8_scales: Vec<f32>,
+    pub down_int8_sums: Vec<i32>,
 }
 
 unsafe impl Send for DecLayer {}
@@ -86,6 +305,7 @@ pub struct Decoder {
     /// INT8 quantized lm_head weights for fast argmax
     pub lm_head_int8: Option<Vec<i8>>,
     pub lm_head_int8_scales: Option<Vec<f32>>,
+    pub lm_head_int8_sums: Option<Vec<i32>>,
 }
 
 unsafe impl Send for Decoder {}
@@ -118,7 +338,7 @@ fn load_bf16_as_f32_into(ms: &MultiSafetensors, name: &str, out: &mut [f32]) -> 
 
 /// Load and preprocess a single decoder layer's weights (bf16->f32 prefill copies
 /// + INT8 quantized copies). Independent per layer, so callable in parallel.
-fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<DecLayer> {
+fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize, cache: Option<&Int8Cache>) -> Option<DecLayer> {
     let lp = format!("thinker.model.layers.{}", i);
 
     let wq = load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
@@ -130,26 +350,10 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
     let hidden = cfg.dec_hidden;
     let inter = cfg.dec_intermediate;
 
-    let wq_weight_f32_prefill = {
-        let mut v = superpage_vec::<f32>(q_dim * hidden);
-        load_bf16_as_f32_into(ms, &format!("{}.self_attn.q_proj.weight", lp), &mut v)?;
-        v
-    };
-    let wk_weight_f32_prefill = {
-        let mut v = superpage_vec::<f32>(kv_dim * hidden);
-        load_bf16_as_f32_into(ms, &format!("{}.self_attn.k_proj.weight", lp), &mut v)?;
-        v
-    };
-    let wv_weight_f32_prefill = {
-        let mut v = superpage_vec::<f32>(kv_dim * hidden);
-        load_bf16_as_f32_into(ms, &format!("{}.self_attn.v_proj.weight", lp), &mut v)?;
-        v
-    };
-    let wo_weight_f32_prefill = {
-        let mut v = superpage_vec::<f32>(hidden * q_dim);
-        load_bf16_as_f32_into(ms, &format!("{}.self_attn.o_proj.weight", lp), &mut v)?;
-        v
-    };
+    let wq_weight_f32_prefill: Option<Vec<f32>> = None;
+    let wk_weight_f32_prefill: Option<Vec<f32>> = None;
+    let wv_weight_f32_prefill: Option<Vec<f32>> = None;
+    let wo_weight_f32_prefill: Option<Vec<f32>> = None;
 
     let q_norm = load_f32(ms, &format!("{}.self_attn.q_norm.weight", lp))?;
     let k_norm = load_f32(ms, &format!("{}.self_attn.k_norm.weight", lp))?;
@@ -160,7 +364,7 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
     let up_bf16 = load_bf16_direct(ms, &format!("{}.mlp.up_proj.weight", lp))?;
     let down_bf16 = load_bf16_direct(ms, &format!("{}.mlp.down_proj.weight", lp))?;
 
-    // Fuse gate+up: interleave rows
+    // Fuse gate+up: interleave rows (for BF16 path, kept for compatibility)
     let mut gate_up_fused = vec![0u16; 2 * inter * hidden];
     unsafe {
         let gate_slice = std::slice::from_raw_parts(gate_bf16, inter * hidden);
@@ -172,22 +376,42 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
                 .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
         }
     }
-    let mut gate_up_fused_f32_prefill = superpage_vec::<f32>(2 * inter * hidden);
-    kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
-    let down_weight_f32_prefill = {
-        let mut v = superpage_vec::<f32>(hidden * inter);
-        load_bf16_as_f32_into(ms, &format!("{}.mlp.down_proj.weight", lp), &mut v)?;
-        v
-    };
+    // F32 prefill eliminated: INT8 path handles prefill now
+    let gate_up_fused_f32_prefill: Option<Vec<f32>> = None;
+    let down_weight_f32_prefill: Option<Vec<f32>> = None;
 
-    // INT8 quantize all decoder layer weights into superpage-aligned buffers
-    let (wq_int8, wq_int8_scales) = quantize_to_superpage(wq, q_dim, hidden);
-    let (wk_int8, wk_int8_scales) = quantize_to_superpage(wk, kv_dim, hidden);
-    let (wv_int8, wv_int8_scales) = quantize_to_superpage(wv, kv_dim, hidden);
-    let (wo_int8, wo_int8_scales) = quantize_to_superpage(wo, hidden, q_dim);
-    let (gate_up_int8, gate_up_int8_scales) =
-        quantize_to_superpage(gate_up_fused.as_ptr(), 2 * inter, hidden);
-    let (down_int8, down_int8_scales) = quantize_to_superpage(down_bf16, hidden, inter);
+    // INT8 quantize all decoder layer weights into superpage-aligned buffers.
+    // If cache is available, load pre-computed INT8 data instead of quantizing.
+    let (wq_int8, wq_int8_scales, wq_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 0)
+    } else {
+        quantize_to_superpage(wq, q_dim, hidden)
+    };
+    let (wk_int8, wk_int8_scales, wk_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 1)
+    } else {
+        quantize_to_superpage(wk, kv_dim, hidden)
+    };
+    let (wv_int8, wv_int8_scales, wv_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 2)
+    } else {
+        quantize_to_superpage(wv, kv_dim, hidden)
+    };
+    let (wo_int8, wo_int8_scales, wo_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 3)
+    } else {
+        quantize_to_superpage(wo, hidden, q_dim)
+    };
+    let (gate_up_int8, gate_up_int8_scales, gate_up_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 4)
+    } else {
+        quantize_to_superpage(gate_up_fused.as_ptr(), 2 * inter, hidden)
+    };
+    let (down_int8, down_int8_scales, down_int8_sums) = if let Some(c) = cache {
+        c.get_layer_weight(i, 5)
+    } else {
+        quantize_to_superpage(down_bf16, hidden, inter)
+    };
 
     Some(DecLayer {
         wq_weight_bf16: wq,
@@ -210,28 +434,39 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize) -> Option<D
         down_weight_f32_prefill,
         wq_int8,
         wq_int8_scales,
+        wq_int8_sums,
         wk_int8,
         wk_int8_scales,
+        wk_int8_sums,
         wv_int8,
         wv_int8_scales,
+        wv_int8_sums,
         wo_int8,
         wo_int8_scales,
+        wo_int8_sums,
         gate_up_int8,
         gate_up_int8_scales,
+        gate_up_int8_sums,
         down_int8,
         down_int8_scales,
+        down_int8_sums,
     })
 }
 
 impl Decoder {
-    pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
+    pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig, model_dir: &str) -> Option<Self> {
         let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
+
+        // Try loading INT8 cache to skip quantization
+        let cache_path = format!("{}/.int8_cache.bin", model_dir);
+        let int8_cache = Int8Cache::load(&cache_path, cfg);
 
         // Per-layer weight loading is independent and conversion-heavy
         // (bf16->f32 prefill + INT8 quantization), so load layers in parallel.
         let nlayers = cfg.dec_layers;
         let nthreads = kernels::get_num_cpus().min(nlayers).max(1);
         let chunk = nlayers.div_ceil(nthreads);
+        let cache_ref = int8_cache.as_ref();
         let mut indexed: Vec<(usize, DecLayer)> = std::thread::scope(|s| {
             let mut handles = Vec::new();
             for t in 0..nthreads {
@@ -243,7 +478,7 @@ impl Decoder {
                 handles.push(s.spawn(move || {
                     let mut out = Vec::with_capacity(end - start);
                     for i in start..end {
-                        out.push((i, load_dec_layer(ms, cfg, i)?));
+                        out.push((i, load_dec_layer(ms, cfg, i, cache_ref)?));
                     }
                     Some(out)
                 }));
@@ -272,7 +507,18 @@ impl Decoder {
         let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16);
         let lm_out_dim = cfg.lm_head_dim();
         let lm_in_dim = cfg.dec_hidden;
-        let (lm_int8, lm_scales) = quantize_to_superpage(lm_weight, lm_out_dim, lm_in_dim);
+        let (lm_int8, lm_scales, lm_sums) = if let Some(c) = int8_cache.as_ref() {
+            c.get_lm_head_weight()
+        } else {
+            quantize_to_superpage(lm_weight, lm_out_dim, lm_in_dim)
+        };
+
+        // If no cache existed, save one for next time
+        if int8_cache.is_none() {
+            if let Some(decoder_ref) = Self::build_cache(&layers, &lm_int8, &lm_scales, &lm_sums, cfg) {
+                let _ = decoder_ref.save(&cache_path);
+            }
+        }
 
         Some(Decoder {
             tok_embeddings_bf16,
@@ -281,7 +527,22 @@ impl Decoder {
             lm_head_bf16,
             lm_head_int8: Some(lm_int8),
             lm_head_int8_scales: Some(lm_scales),
+            lm_head_int8_sums: Some(lm_sums),
         })
+    }
+
+    /// Release F32 prefill weights to reduce memory after prefill is complete.
+    /// After calling this, `decoder_prefill` will panic if called again.
+    /// `decoder_forward` (INT8/BF16 decode path) is unaffected.
+    pub fn free_prefill_weights(&mut self) {
+        for layer in &mut self.layers {
+            layer.wq_weight_f32_prefill = None;
+            layer.wk_weight_f32_prefill = None;
+            layer.wv_weight_f32_prefill = None;
+            layer.wo_weight_f32_prefill = None;
+            layer.gate_up_fused_f32_prefill = None;
+            layer.down_weight_f32_prefill = None;
+        }
     }
 }
 
@@ -487,6 +748,7 @@ pub struct DecoderBuffers {
     pub proj_out: Vec<f32>,
     pub gate_buf: Vec<f32>,
     pub ffn_out: Vec<f32>,
+    pub x_int8_buf: Vec<i8>,
 
     // Prefill buffers
     pub pref_x: Vec<f32>,
@@ -525,6 +787,7 @@ impl DecoderBuffers {
             proj_out: vec![0.0f32; dim],
             gate_buf: vec![0.0f32; 2 * intermediate],
             ffn_out: vec![0.0f32; intermediate],
+            x_int8_buf: vec![0i8; dim.max(q_dim).max(intermediate)],
             pref_x: Vec::new(),
             pref_x_norm: Vec::new(),
             pref_q: Vec::new(),
@@ -583,6 +846,7 @@ pub fn decoder_prefill(
     input_embeds: &[f32],
     seq_len: usize,
 ) {
+    let _pg_total = kernels::ProfileGuard::new(&kernels::PROF.dec_prefill_total);
     let dim = cfg.dec_hidden;
     let n_heads = cfg.dec_heads;
     let n_kv_heads = cfg.dec_kv_heads;
@@ -626,22 +890,13 @@ pub fn decoder_prefill(
         let k = &mut bufs.pref_k[..seq_len * kv_dim];
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
-        kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
-        kernels::linear_nobias(
-            k,
+        kernels::linear_int8_qkv_prefill_fused_nobias(
+            q, k, v,
             x_norm,
-            &layer.wk_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
-        );
-        kernels::linear_nobias(
-            v,
-            x_norm,
-            &layer.wv_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
+            &layer.wq_int8, &layer.wq_int8_scales, &layer.wq_int8_sums,
+            &layer.wk_int8, &layer.wk_int8_scales, &layer.wk_int8_sums,
+            &layer.wv_int8, &layer.wv_int8_scales, &layer.wv_int8_sums,
+            seq_len, dim, q_dim, kv_dim,
         );
 
         kernels::rms_norm_per_head(q, &layer.q_norm_weight, seq_len, n_heads, head_dim, eps);
@@ -686,10 +941,12 @@ pub fn decoder_prefill(
         );
 
         let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
-        kernels::linear_nobias(
+        kernels::linear_nobias_int8_prefill_tiled(
             proj_out,
             attn_out,
-            &layer.wo_weight_f32_prefill,
+            &layer.wo_int8,
+            &layer.wo_int8_scales,
+            &layer.wo_int8_sums,
             seq_len,
             q_dim,
             dim,
@@ -708,10 +965,12 @@ pub fn decoder_prefill(
         );
 
         let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
-        kernels::linear_nobias(
+        kernels::linear_nobias_int8_prefill_tiled(
             gate_up,
             x_norm2,
-            &layer.gate_up_fused_f32_prefill,
+            &layer.gate_up_int8,
+            &layer.gate_up_int8_scales,
+            &layer.gate_up_int8_sums,
             seq_len,
             dim,
             2 * intermediate,
@@ -721,10 +980,12 @@ pub fn decoder_prefill(
         kernels::swiglu_multiply(gate, gate_up, seq_len, intermediate);
 
         let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
-        kernels::linear_nobias(
+        kernels::linear_nobias_int8_prefill_tiled(
             ffn_out,
             gate,
-            &layer.down_weight_f32_prefill,
+            &layer.down_int8,
+            &layer.down_int8_scales,
+            &layer.down_int8_sums,
             seq_len,
             intermediate,
             dim,
@@ -744,6 +1005,7 @@ pub fn decoder_forward(
     bufs: &mut DecoderBuffers,
     input_embed: &[f32],
 ) -> i32 {
+    let _pg_total = kernels::ProfileGuard::new(&kernels::PROF.dec_forward_total);
     let dim = cfg.dec_hidden;
     let n_heads = cfg.dec_heads;
     let n_kv_heads = cfg.dec_kv_heads;
@@ -778,8 +1040,7 @@ pub fn decoder_forward(
             eps,
         );
 
-        // INT8 fused QKV projection (aarch64 only, BF16 fallback on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        // INT8 fused QKV projection (all arches: aarch64 NEON + x86_64 AVX2)
         kernels::linear_nobias_int8_qkv(
             &mut bufs.q[..q_dim],
             &mut bufs.k[..kv_dim],
@@ -787,20 +1048,18 @@ pub fn decoder_forward(
             &bufs.x_norm[..dim],
             &layer.wq_int8,
             &layer.wq_int8_scales,
+            &layer.wq_int8_sums,
             &layer.wk_int8,
             &layer.wk_int8_scales,
+            &layer.wk_int8_sums,
             &layer.wv_int8,
             &layer.wv_int8_scales,
+            &layer.wv_int8_sums,
             dim,
             q_dim,
             kv_dim,
+            &mut bufs.x_int8_buf,
         );
-        #[cfg(not(target_arch = "aarch64"))]
-        unsafe {
-            kernels::linear_nobias_bf16(&mut bufs.q[..q_dim], &bufs.x_norm[..dim], layer.wq_weight_bf16, 1, dim, q_dim);
-            kernels::linear_nobias_bf16(&mut bufs.k[..kv_dim], &bufs.x_norm[..dim], layer.wk_weight_bf16, 1, dim, kv_dim);
-            kernels::linear_nobias_bf16(&mut bufs.v[..kv_dim], &bufs.x_norm[..dim], layer.wv_weight_bf16, 1, dim, kv_dim);
-        }
 
         kernels::rms_norm_per_head(
             &mut bufs.q[..q_dim],
@@ -859,23 +1118,16 @@ pub fn decoder_forward(
             pos,
         );
 
-        // O-projection with fused residual add: x += attn_out @ wo (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        // O-projection with fused residual add: x += attn_out @ wo (INT8 for all arches)
         kernels::linear_nobias_int8_addto(
             &mut bufs.x[..dim],
             &bufs.attn_out[..q_dim],
             &layer.wo_int8,
             &layer.wo_int8_scales,
+            &layer.wo_int8_sums,
             q_dim,
             dim,
-        );
-        #[cfg(not(target_arch = "aarch64"))]
-        kernels::linear_nobias_bf16_addto(
-            &mut bufs.x[..dim],
-            &bufs.attn_out[..q_dim],
-            layer.wo_weight_bf16,
-            q_dim,
-            dim,
+            &mut bufs.x_int8_buf,
         );
 
         kernels::rms_norm(
@@ -887,42 +1139,29 @@ pub fn decoder_forward(
             eps,
         );
 
-        // gate_up + SwiGLU (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        // gate_up + SwiGLU (INT8 for all arches)
         kernels::linear_nobias_int8_swiglu(
             &mut bufs.ffn_out[..intermediate],
             &bufs.x_norm[..dim],
             &layer.gate_up_int8,
             &layer.gate_up_int8_scales,
+            &layer.gate_up_int8_sums,
             dim,
             intermediate,
-        );
-        #[cfg(not(target_arch = "aarch64"))]
-        kernels::linear_nobias_bf16_swiglu(
-            &mut bufs.ffn_out[..intermediate],
-            &bufs.x_norm[..dim],
-            layer.gate_up_fused_bf16.as_ptr(),
-            dim,
-            intermediate,
+            &mut bufs.x_int8_buf,
+            &mut bufs.gate_buf,
         );
 
-        // down-projection with fused residual add: x += ffn_out @ down (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        // down-projection with fused residual add: x += ffn_out @ down (INT8 for all arches)
         kernels::linear_nobias_int8_addto(
             &mut bufs.x[..dim],
             &bufs.ffn_out[..intermediate],
             &layer.down_int8,
             &layer.down_int8_scales,
+            &layer.down_int8_sums,
             intermediate,
             dim,
-        );
-        #[cfg(not(target_arch = "aarch64"))]
-        kernels::linear_nobias_bf16_addto(
-            &mut bufs.x[..dim],
-            &bufs.ffn_out[..intermediate],
-            layer.down_weight_bf16,
-            intermediate,
-            dim,
+            &mut bufs.x_int8_buf,
         );
     }
 
@@ -940,12 +1179,11 @@ pub fn decoder_forward(
     bufs.x[..dim].copy_from_slice(&bufs.x_norm[..dim]);
     let lm_out_dim = cfg.lm_head_dim();
 
-    // Use INT8 quantized argmax on aarch64 (2x less bandwidth), BF16 on x86_64
-    #[cfg(target_arch = "aarch64")]
-    if let (Some(ref int8_data), Some(ref scales)) =
-        (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
+    // INT8 quantized argmax (all arches: aarch64 NEON + x86_64 AVX2, 2x less bandwidth)
+    if let (Some(ref int8_data), Some(ref scales), Some(ref sums)) =
+        (&decoder.lm_head_int8, &decoder.lm_head_int8_scales, &decoder.lm_head_int8_sums)
     {
-        return kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, dim, lm_out_dim)
+        return kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, sums, dim, lm_out_dim)
             as i32;
     }
 

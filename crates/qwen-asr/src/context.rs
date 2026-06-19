@@ -128,7 +128,7 @@ impl QwenCtx {
         }
         let decoder = {
             let _pg = kernels::ProfileGuard::new(&kernels::PROF.decoder_load);
-            Decoder::load(&ms, &cfg)?
+            Decoder::load(&ms, &cfg, model_dir)?
         };
 
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);

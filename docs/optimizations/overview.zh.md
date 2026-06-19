@@ -38,3 +38,19 @@
 - **静音压缩**: 基于能量的 VAD 预处理剥离非语音片段。边缘填充降至 2 个窗口，并消除非语音拖尾，直接减少 Encoder 和 Decoder 输入。
 - **流式惰性编码**: 流式模式下，局部的 Encoder 尾部仅每隔一个 Chunk 重新编码。提供最长公共前缀 (LCP) 复用，跳过重新编码的 Chunk 的 Decoder Prefill 开销降低约 50%。
 - **在线 Softmax**: 单 Token Causal Attention 使用在线 Softmax 扫描，在单次循环内完成分数追踪、归一化和值累加，避免为 `seq_len = 1` 场景分配临时数组和二次遍历。
+
+## 6. Windows x86 (AVX2) 平台优化
+
+- **AVX2 INT8 GEMM 内核**: PMADDUBSW (u8×s8→i16) + PMADDWD (i16×i16→i32) + XOR 0x80 符号翻转补偿。4行批量内核提升缓存效率。
+- **OpenBLAS 线程调优**: 12线程池中8个OpenBLAS线程最优（2/3比例）。环境变量 `OPENBLAS_NUM_THREADS` 在 `main()` 中设置（DLL仅导出 `cblas_sgemm`）。
+- **分块 INT8 GEMM**: 外层循环 = o_block（4输出行），内层循环 = token。权重每个 o_block 加载一次并跨所有 token 复用，权重内存流量从 `seq_len × out_dim × in_dim` 降至 `out_dim × in_dim`。
+- **Fused QKV 量化**: 量化输入激活一次，复用给 Q/K/V 三个投影。节省 2/3 量化开销（内存分配 + 计算）。编码器（相同 out_dim，带 bias）和解码器（GQA: q_dim/kv_dim，无 bias）两个变体。
+- **效果**: sgemm -91.8%，realtime 1.03x → 3.56x（1.7B 模型，28.2s 音频）。
+
+## 7. 经验知识库
+
+详见 [experience-ledger.md](experience-ledger.md)，包含：
+- 跨平台成功经验与失败教训
+- 性能演进数据（Apple M5 + Windows x86）
+- 平台特定陷阱与最佳实践
+- 后续优化的持续更新机制

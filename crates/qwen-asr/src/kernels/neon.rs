@@ -635,9 +635,10 @@ pub unsafe fn gelu_inplace(x: &mut [f32], n: usize) {
 /// w_bf16 must point to at least out_dim * in_dim valid bf16 values.
 /// in_dim must be a multiple of 16 for alignment.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn quantize_bf16_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<f32>) {
+pub unsafe fn quantize_bf16_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
     let mut int8_data = vec![0i8; out_dim * in_dim];
     let mut scales = vec![0.0f32; out_dim];
+    let mut w_sums = vec![0i32; out_dim];
 
     for row in 0..out_dim {
         let w_row = w_bf16.add(row * in_dim);
@@ -688,9 +689,16 @@ pub unsafe fn quantize_bf16_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: 
             dst[k] = q;
             k += 1;
         }
+
+        // Compute w_sum for this row
+        let mut row_sum: i32 = 0;
+        for k in 0..in_dim {
+            row_sum += int8_data[row * in_dim + k] as i32;
+        }
+        w_sums[row] = row_sum;
     }
 
-    (int8_data, scales)
+    (int8_data, scales, w_sums)
 }
 
 /// SDOT via inline assembly (stable Rust, avoids unstable vdotq_s32)
@@ -715,10 +723,11 @@ unsafe fn sdot_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn matvec_int8(
     y: &mut [f32], x_int8: *const i8, x_scale: f32,
-    w_int8: *const i8, w_scales: &[f32],
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
     bias: Option<&[f32]>,
     in_dim: usize, out_dim: usize,
 ) {
+    let _ = w_sums; // NEON SDOT does not need XOR 0x80 correction
     let mut o = 0;
     while o + 1 < out_dim {
         let w0 = w_int8.add(o * in_dim);
@@ -801,9 +810,10 @@ pub unsafe fn matvec_int8(
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn argmax_int8_range(
     x_int8: *const i8, x_scale: f32,
-    w_int8: *const i8, w_scales: &[f32],
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
     in_dim: usize, start: usize, end: usize,
 ) -> (usize, f32) {
+    let _ = w_sums; // NEON SDOT does not need XOR 0x80 correction
     let mut best = start;
     let mut best_val = -1e30f32;
     let mut o = start;

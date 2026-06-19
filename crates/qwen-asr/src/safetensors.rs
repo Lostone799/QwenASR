@@ -1,7 +1,6 @@
 //! Safetensors mmap reader with multi-shard support.
 
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
 use std::path::Path;
 
 const MAX_TENSORS: usize = 1024;
@@ -56,9 +55,46 @@ impl TensorMeta {
     }
 }
 
-pub struct SafetensorsFile {
-    _fd: RawFd,
+// Platform-specific storage for mmap/read data
+#[cfg(unix)]
+struct FileData {
+    _fd: std::os::unix::io::RawFd,
     data: *mut u8,
+    file_size: usize,
+}
+
+#[cfg(unix)]
+unsafe impl Send for FileData {}
+#[cfg(unix)]
+unsafe impl Sync for FileData {}
+
+#[cfg(unix)]
+impl Drop for FileData {
+    fn drop(&mut self) {
+        if !self.data.is_null() {
+            unsafe { libc::munmap(self.data as *mut _, self.file_size); }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct FileData {
+    // On Windows we use mmap (via memmap2) for zero-copy file access.
+    // This avoids loading the entire file into RAM, which is critical
+    // for large models on memory-constrained systems (e.g. 8GB RAM + 4.6GB model).
+    _mmap: memmap2::Mmap,
+    _file: std::fs::File,
+}
+
+pub struct SafetensorsFile {
+    #[cfg(unix)]
+    #[allow(dead_code)] // Drop impl uses file_data for munmap cleanup
+    file_data: FileData,
+    #[cfg(windows)]
+    #[allow(dead_code)] // Drop impl uses file_data for Vec cleanup
+    file_data: FileData,
+    data_ptr: *const u8,
+    #[allow(dead_code)] // Retained for potential future use / debugging
     file_size: usize,
     header_size: usize,
     pub tensors: Vec<TensorMeta>,
@@ -69,56 +105,50 @@ unsafe impl Send for SafetensorsFile {}
 unsafe impl Sync for SafetensorsFile {}
 
 impl SafetensorsFile {
+    #[cfg(unix)]
     pub fn open(path: &str) -> Option<Self> {
-        use libc::*;
         use std::ffi::CString;
 
         let c_path = CString::new(path).ok()?;
-        let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
         if fd < 0 {
             return None;
         }
 
-        let mut stat_buf = unsafe { std::mem::zeroed::<stat>() };
-        if unsafe { fstat(fd, &mut stat_buf) } < 0 {
-            unsafe { close(fd); }
+        let mut stat_buf = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(fd, &mut stat_buf) } < 0 {
+            unsafe { libc::close(fd); }
             return None;
         }
 
         let file_size = stat_buf.st_size as usize;
         if file_size < 8 {
-            unsafe { close(fd); }
+            unsafe { libc::close(fd); }
             return None;
         }
 
         let data = unsafe {
-            mmap(
+            libc::mmap(
                 std::ptr::null_mut(),
                 file_size,
-                PROT_READ,
-                MAP_PRIVATE,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
                 fd,
                 0,
             )
         };
-        // Keep fd open for mmap lifetime? Actually mmap doesn't need it.
-        // But we close it since MAP_PRIVATE doesn't need fd after mmap.
         let raw_fd = fd;
-        unsafe { close(fd); }
+        unsafe { libc::close(fd); }
 
         if data == libc::MAP_FAILED {
             return None;
         }
         let data = data as *mut u8;
 
-        // Prefault the mmap so first-touch page faults don't serialize inside
-        // the weight-conversion loops. MADV_WILLNEED is asynchronous and safe
-        // to ignore on failure.
         unsafe {
             libc::madvise(data as *mut _, file_size, libc::MADV_WILLNEED);
         }
 
-        // Read header size (first 8 bytes, little-endian u64)
         let header_size = unsafe {
             let mut buf = [0u8; 8];
             std::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), 8);
@@ -126,11 +156,9 @@ impl SafetensorsFile {
         };
 
         if header_size > file_size - 8 {
-            unsafe { munmap(data as *mut _, file_size); }
             return None;
         }
 
-        // Parse JSON header
         let header_json = unsafe {
             let slice = std::slice::from_raw_parts(data.add(8), header_size);
             std::str::from_utf8(slice).ok()?
@@ -143,8 +171,56 @@ impl SafetensorsFile {
         }
 
         Some(SafetensorsFile {
-            _fd: raw_fd,
-            data,
+            file_data: FileData { _fd: raw_fd, data, file_size },
+            data_ptr: data,
+            file_size,
+            header_size,
+            tensors,
+            tensor_map,
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn open(path: &str) -> Option<Self> {
+        use std::fs::File;
+
+        let file = File::open(path).ok()?;
+        let file_size = file.metadata().ok()?.len() as usize;
+        if file_size < 8 {
+            return None;
+        }
+
+        // Use mmap for zero-copy file access.
+        // The OS lazily loads pages on demand, so only accessed portions
+        // consume physical RAM. This is critical for 8GB RAM systems
+        // loading 4.6GB model files.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
+
+        let buf = &mmap[..];
+
+        let header_size = {
+            let mut hbuf = [0u8; 8];
+            hbuf.copy_from_slice(&buf[..8]);
+            u64::from_le_bytes(hbuf) as usize
+        };
+
+        if header_size > file_size - 8 {
+            return None;
+        }
+
+        let header_json = std::str::from_utf8(&buf[8..8 + header_size]).ok()?;
+
+        let tensors = parse_header(header_json)?;
+        let mut tensor_map = HashMap::new();
+        for (i, t) in tensors.iter().enumerate() {
+            tensor_map.insert(t.name.clone(), i);
+        }
+
+        let data_ptr = buf.as_ptr();
+
+        Some(SafetensorsFile {
+            file_data: FileData { _mmap: mmap, _file: file },
+            data_ptr,
             file_size,
             header_size,
             tensors,
@@ -157,7 +233,7 @@ impl SafetensorsFile {
     }
 
     pub fn data_ptr(&self, tensor: &TensorMeta) -> *const u8 {
-        unsafe { self.data.add(8 + self.header_size + tensor.data_offset) }
+        unsafe { self.data_ptr.add(8 + self.header_size + tensor.data_offset) }
     }
 
     /// Get tensor data as f32 Vec (converts from BF16 if needed).
@@ -201,15 +277,6 @@ impl SafetensorsFile {
     }
 }
 
-impl Drop for SafetensorsFile {
-    fn drop(&mut self) {
-        if !self.data.is_null() {
-            unsafe {
-                libc::munmap(self.data as *mut _, self.file_size);
-            }
-        }
-    }
-}
 
 pub struct MultiSafetensors {
     pub shards: Vec<SafetensorsFile>,

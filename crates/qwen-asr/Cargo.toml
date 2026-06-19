@@ -21,9 +21,16 @@ libc = "0.2"
 no-default-features = true
 
 [features]
-default = ["blas", "vdsp"]
+default = ["blas"]
 blas = []
 vdsp = []
 ios = []
 android = []
 macos-ffi = []
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+memmap2 = "0.9"

@@ -286,6 +286,10 @@ fn transcribe_segment(
         prefill_len,
     );
 
+    // Release F32 prefill weights — no longer needed after prefill completes.
+    // This saves ~50% of decoder memory for the 1.7B model.
+    ctx.decoder.free_prefill_weights();
+
     // First token from last prefill position
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
     let mut token = decoder::decoder_forward(
@@ -304,16 +308,22 @@ fn transcribe_segment(
 
     // Autoregressive decode
     let t0 = get_time_ms();
-    let max_tokens = if ctx.perf_audio_ms > (LONG_AUDIO_FAST_CAP_SEC as f64 * 1000.0) {
+    // Dynamic max_tokens: scale with audio duration (ref: stt-lite max(30, dur*8))
+    // Chinese speech rate ~5-6 chars/sec, BPE ~1.3-1.5 chars/token
+    // Coefficient 8 balances output length vs repetition risk
+    let audio_sec = ctx.perf_audio_ms / 1000.0;
+    let max_tokens = if audio_sec > (LONG_AUDIO_FAST_CAP_SEC as f64) {
         LONG_AUDIO_FAST_MAX_TOKENS
     } else {
-        2048
+        (30.0_f64.max(audio_sec * 8.0)) as i32
     };
     let mut n_generated = 0;
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut tmp_embed = vec![0.0f32; dim];
+    // Repetition detection state (ref: stt-lite)
+    let mut recent_text: Vec<u8> = Vec::new();
 
     while n_generated < max_tokens {
         n_generated += 1;
@@ -336,6 +346,40 @@ fn transcribe_segment(
 
             if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
                 break;
+            }
+
+            // Repetition detection: check if tail contains repeated blocks
+            // (ref: stt-lite pattern detection)
+            recent_text.extend_from_slice(piece_bytes);
+            if recent_text.len() > 20 {
+                let tail = &recent_text[recent_text.len().saturating_sub(20)..];
+                let mut is_repeating = false;
+                for rep_len in 2..=4usize {
+                    if rep_len > tail.len() / 2 {
+                        break;
+                    }
+                    let pattern = &tail[tail.len() - rep_len..];
+                    let mut repeat_count = 1usize;
+                    let mut check_start = tail.len() - rep_len;
+                    while check_start >= rep_len {
+                        check_start -= rep_len;
+                        if &tail[check_start..check_start + rep_len] == pattern {
+                            repeat_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if repeat_count >= 4 {
+                        is_repeating = true;
+                        break;
+                    }
+                }
+                if is_repeating {
+                    if kernels::verbose() >= 2 {
+                        eprintln!("  [repetition] aborting at token {}", n_text_tokens);
+                    }
+                    break;
+                }
             }
         }
 

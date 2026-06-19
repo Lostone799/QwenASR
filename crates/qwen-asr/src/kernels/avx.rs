@@ -562,6 +562,614 @@ pub unsafe fn gelu_inplace(x: &mut [f32], n: usize) {
     }
 }
 
+/// Horizontal sum of __m256i (8 x i32) -> i32
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_epi32(v: __m256i) -> i32 {
+    // Add high 128 to low 128
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(lo, hi); // [a, b, c, d]
+    // Swap adjacent pairs: [b, a, d, c] so adding gives [a+b, a+b, c+d, c+d]
+    let shuf = _mm_shuffle_epi32(sum128, 0b10_11_00_01); // 0xB1
+    let sum64 = _mm_add_epi32(sum128, shuf); // [a+b, a+b, c+d, c+d]
+    // Broadcast dword 2 (c+d) to dword 0
+    let hi32 = _mm_shuffle_epi32(sum64, 0b00_00_00_10); // 0x0E
+    let sum32 = _mm_add_epi32(sum64, hi32); // [a+b+c+d, ...]
+    _mm_cvtsi128_si32(sum32)
+}
+
+// ============================================================================
+// INT8 kernel helpers — shared by matvec and argmax to eliminate duplication.
+// All helpers are #[inline(always)] to ensure zero abstraction cost.
+// ============================================================================
+
+/// XOR 0x80 sign-flip constant for converting i8 → u8 (128-bit).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn sign_flip_128() -> __m128i {
+    _mm_set1_epi8(-128i8 as u8 as i8)
+}
+
+/// XOR 0x80 sign-flip constant for converting i8 → u8 (256-bit).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn sign_flip_256() -> __m256i {
+    _mm256_set1_epi8(-128i8 as u8 as i8)
+}
+
+/// AVX2 PMADDUBSW dot product: accumulate 32 i8×i8 pairs into acc.
+/// `xu` is u8 (already XOR-flipped), `w` is i8.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_i8_avx2_acc(
+    acc: __m256i,
+    xu_lo: __m128i, xu_hi: __m128i,
+    w_lo: __m128i, w_hi: __m128i,
+) -> __m256i {
+    let p_lo = _mm_maddubs_epi16(xu_lo, w_lo);
+    let p_hi = _mm_maddubs_epi16(xu_hi, w_hi);
+    let m_lo = _mm_madd_epi16(p_lo, _mm_set1_epi16(1));
+    let m_hi = _mm_madd_epi16(p_hi, _mm_set1_epi16(1));
+    _mm256_add_epi32(acc, _mm256_set_m128i(m_hi, m_lo))
+}
+
+/// VNNI dot product: accumulate 32 i8×i8 pairs into acc using vpdpbusd.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avxvnni")]
+#[inline]
+unsafe fn dot_i8_vnni_acc(
+    acc: __m256i,
+    xu: __m256i,
+    w: __m256i,
+) -> __m256i {
+    _mm256_dpbusd_epi32(acc, xu, w)
+}
+
+/// Scalar tail: compute remaining i8×i8 dot product for elements [k..in_dim).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dot_i8_tail(x: *const i8, w: *const i8, k: usize, in_dim: usize) -> i32 {
+    let mut sum: i32 = 0;
+    for i in k..in_dim {
+        sum += *x.add(i) as i32 * (*w.add(i) as i32);
+    }
+    sum
+}
+
+/// Apply XOR 0x80 correction and scale: `(simd_sum - 128*w_sum + tail) * x_scale * w_scale`
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn finalize_int8(simd_sum: i32, w_sum: i32, tail: i32, x_scale: f32, w_scale: f32) -> f32 {
+    let corrected = simd_sum - 128 * w_sum + tail;
+    corrected as f32 * x_scale * w_scale
+}
+
+/// AVX2 optimized dot product using 256-bit PMADDWD.
+/// Combines two 128-bit PMADDUBSW results into 256-bit and uses single PMADDWD.
+/// Saves 1 instruction vs dot_i8_avx2_acc.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_i8_avx2_acc_256(
+    acc: __m256i,
+    xu_lo: __m128i, xu_hi: __m128i,
+    w_lo: __m128i, w_hi: __m128i,
+    ones256: __m256i,
+) -> __m256i {
+    let p_lo = _mm_maddubs_epi16(xu_lo, w_lo);
+    let p_hi = _mm_maddubs_epi16(xu_hi, w_hi);
+    let p256 = _mm256_set_m128i(p_hi, p_lo);
+    let m256 = _mm256_madd_epi16(p256, ones256);
+    _mm256_add_epi32(acc, m256)
+}
+
+/// AVX2 256-bit dot product: accumulate 32 i8×i8 pairs using single 256-bit PMADDUBSW + PMADDWD.
+/// More efficient than two 128-bit operations + combine (saves 1 combine + 1 PMADDUBSW on Port 0).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_i8_avx2_acc_256v2(
+    acc: __m256i,
+    xu: __m256i,  // 256-bit u8 (already XOR-flipped)
+    w: __m256i,   // 256-bit i8
+    ones256: __m256i,
+) -> __m256i {
+    let p = _mm256_maddubs_epi16(xu, w);      // 32 u8×i8 → 16 i16
+    let m = _mm256_madd_epi16(p, ones256);     // 16 i16 → 8 i32
+    _mm256_add_epi32(acc, m)
+}
+
+/// AVX2 INT8 GEMM kernel: process 4 output rows simultaneously.
+/// Uses 256-bit loads and operations for maximum throughput.
+/// Shares x_int8 loads across 4 weight rows to reduce memory traffic by 75%.
+///
+/// # Safety
+/// Uses AVX2 intrinsics. Caller must ensure pointers are valid and CPU supports AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn int8_gemm_4rows_avx2(
+    y: *mut f32,
+    x_int8: *const i8,
+    x_scale: f32,
+    w_int8: *const i8,      // (4, in_dim) row-major
+    w_scales: *const f32,   // (4,)
+    w_sums: *const i32,     // (4,)
+    in_dim: usize,
+) {
+    let sf256 = sign_flip_256();
+    let sf128 = sign_flip_128();
+    let ones256 = _mm256_set1_epi16(1);
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+
+    let mut k = 0usize;
+    // Main loop: 32 bytes per iteration using 256-bit operations
+    while k + 32 <= in_dim {
+        let x = _mm256_loadu_si256(x_int8.add(k) as *const __m256i);
+        let xu = _mm256_xor_si256(x, sf256);
+
+        // 4 weight rows share the same xu (256-bit)
+        acc0 = dot_i8_avx2_acc_256v2(acc0, xu,
+            _mm256_loadu_si256(w_int8.add(0 * in_dim + k) as *const __m256i), ones256);
+        acc1 = dot_i8_avx2_acc_256v2(acc1, xu,
+            _mm256_loadu_si256(w_int8.add(1 * in_dim + k) as *const __m256i), ones256);
+        acc2 = dot_i8_avx2_acc_256v2(acc2, xu,
+            _mm256_loadu_si256(w_int8.add(2 * in_dim + k) as *const __m256i), ones256);
+        acc3 = dot_i8_avx2_acc_256v2(acc3, xu,
+            _mm256_loadu_si256(w_int8.add(3 * in_dim + k) as *const __m256i), ones256);
+        k += 32;
+    }
+
+    // Tail: 16 bytes (128-bit fallback)
+    if k + 16 <= in_dim {
+        let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+        acc0 = dot_i8_avx2_acc_256(acc0, xu, _mm_setzero_si128(),
+            _mm_loadu_si128(w_int8.add(0 * in_dim + k) as *const __m128i),
+            _mm_setzero_si128(), ones256);
+        acc1 = dot_i8_avx2_acc_256(acc1, xu, _mm_setzero_si128(),
+            _mm_loadu_si128(w_int8.add(1 * in_dim + k) as *const __m128i),
+            _mm_setzero_si128(), ones256);
+        acc2 = dot_i8_avx2_acc_256(acc2, xu, _mm_setzero_si128(),
+            _mm_loadu_si128(w_int8.add(2 * in_dim + k) as *const __m128i),
+            _mm_setzero_si128(), ones256);
+        acc3 = dot_i8_avx2_acc_256(acc3, xu, _mm_setzero_si128(),
+            _mm_loadu_si128(w_int8.add(3 * in_dim + k) as *const __m128i),
+            _mm_setzero_si128(), ones256);
+        k += 16;
+    }
+
+    // Scalar tail
+    let mut tail0 = 0i32;
+    let mut tail1 = 0i32;
+    let mut tail2 = 0i32;
+    let mut tail3 = 0i32;
+    while k < in_dim {
+        let xi = *x_int8.add(k) as i32;
+        tail0 += xi * (*w_int8.add(0 * in_dim + k) as i32);
+        tail1 += xi * (*w_int8.add(1 * in_dim + k) as i32);
+        tail2 += xi * (*w_int8.add(2 * in_dim + k) as i32);
+        tail3 += xi * (*w_int8.add(3 * in_dim + k) as i32);
+        k += 1;
+    }
+
+    *y.add(0) = finalize_int8(hsum_epi32(acc0), *w_sums.add(0), tail0, x_scale, *w_scales.add(0));
+    *y.add(1) = finalize_int8(hsum_epi32(acc1), *w_sums.add(1), tail1, x_scale, *w_scales.add(1));
+    *y.add(2) = finalize_int8(hsum_epi32(acc2), *w_sums.add(2), tail2, x_scale, *w_scales.add(2));
+    *y.add(3) = finalize_int8(hsum_epi32(acc3), *w_sums.add(3), tail3, x_scale, *w_scales.add(3));
+}
+
+/// AVX-VNNI INT8 GEMM kernel: process 4 output rows with 256-bit vpdpbusd.
+/// 2x throughput vs AVX2. Available on Alder Lake+, Zen 4+.
+///
+/// # Safety
+/// Uses AVX2 + AVX-VNNI intrinsics. Caller must ensure CPU supports AVX-VNNI.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avxvnni")]
+pub unsafe fn int8_gemm_4rows_vnni(
+    y: *mut f32,
+    x_int8: *const i8,
+    x_scale: f32,
+    w_int8: *const i8,
+    w_scales: *const f32,
+    w_sums: *const i32,
+    in_dim: usize,
+) {
+    let sf = sign_flip_256();
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+
+    let mut k = 0usize;
+    while k + 32 <= in_dim {
+        let x0 = _mm_loadu_si128(x_int8.add(k) as *const __m128i);
+        let x1 = _mm_loadu_si128(x_int8.add(k + 16) as *const __m128i);
+        let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
+
+        acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
+            _mm_loadu_si128(w_int8.add(0 * in_dim + k + 16) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(0 * in_dim + k) as *const __m128i)));
+        acc1 = dot_i8_vnni_acc(acc1, xu, _mm256_set_m128i(
+            _mm_loadu_si128(w_int8.add(1 * in_dim + k + 16) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(1 * in_dim + k) as *const __m128i)));
+        acc2 = dot_i8_vnni_acc(acc2, xu, _mm256_set_m128i(
+            _mm_loadu_si128(w_int8.add(2 * in_dim + k + 16) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(2 * in_dim + k) as *const __m128i)));
+        acc3 = dot_i8_vnni_acc(acc3, xu, _mm256_set_m128i(
+            _mm_loadu_si128(w_int8.add(3 * in_dim + k + 16) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(3 * in_dim + k) as *const __m128i)));
+        k += 32;
+    }
+
+    // Tail handling
+    let mut tail0 = 0i32;
+    let mut tail1 = 0i32;
+    let mut tail2 = 0i32;
+    let mut tail3 = 0i32;
+    while k < in_dim {
+        let xi = *x_int8.add(k) as i32;
+        tail0 += xi * (*w_int8.add(0 * in_dim + k) as i32);
+        tail1 += xi * (*w_int8.add(1 * in_dim + k) as i32);
+        tail2 += xi * (*w_int8.add(2 * in_dim + k) as i32);
+        tail3 += xi * (*w_int8.add(3 * in_dim + k) as i32);
+        k += 1;
+    }
+
+    *y.add(0) = finalize_int8(hsum_epi32(acc0), *w_sums.add(0), tail0, x_scale, *w_scales.add(0));
+    *y.add(1) = finalize_int8(hsum_epi32(acc1), *w_sums.add(1), tail1, x_scale, *w_scales.add(1));
+    *y.add(2) = finalize_int8(hsum_epi32(acc2), *w_sums.add(2), tail2, x_scale, *w_scales.add(2));
+    *y.add(3) = finalize_int8(hsum_epi32(acc3), *w_sums.add(3), tail3, x_scale, *w_scales.add(3));
+}
+
+/// AVX2 INT8 matvec: `y = W_int8 @ x_int8 * (x_scale * w_scales[row]) + bias`
+/// Uses 256-bit PMADDUBSW + PMADDWD for i8*i8 dot products on AVX2 (no VNNI).
+///
+/// # Safety
+/// Uses AVX2 intrinsics. Caller must ensure slices are valid.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn matvec_int8_avx2(
+    y: &mut [f32], x_int8: *const i8, x_scale: f32,
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
+    bias: Option<&[f32]>,
+    in_dim: usize, out_dim: usize,
+) {
+    let sf256 = sign_flip_256();
+    let sf128 = sign_flip_128();
+    let ones256 = _mm256_set1_epi16(1);
+    // Process 2 output rows at a time (shares x_int8 loads across 2 rows)
+    let mut o = 0usize;
+    while o + 1 < out_dim {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        // Main loop: 32 bytes per iteration using 256-bit operations
+        while k + 32 <= in_dim {
+            let x = _mm256_loadu_si256(x_int8.add(k) as *const __m256i);
+            let xu = _mm256_xor_si256(x, sf256);
+            acc0 = dot_i8_avx2_acc_256v2(acc0, xu,
+                _mm256_loadu_si256(w0.add(k) as *const __m256i), ones256);
+            acc1 = dot_i8_avx2_acc_256v2(acc1, xu,
+                _mm256_loadu_si256(w1.add(k) as *const __m256i), ones256);
+            k += 32;
+        }
+        // Tail: 16 bytes (128-bit fallback)
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            acc0 = dot_i8_avx2_acc_256(acc0, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w0.add(k) as *const __m128i), _mm_setzero_si128(), ones256);
+            acc1 = dot_i8_avx2_acc_256(acc1, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w1.add(k) as *const __m128i), _mm_setzero_si128(), ones256);
+            k += 16;
+        }
+
+        let tail0 = dot_i8_tail(x_int8, w0, k, in_dim);
+        let tail1 = dot_i8_tail(x_int8, w1, k, in_dim);
+
+        let mut v0 = finalize_int8(hsum_epi32(acc0), w_sums[o], tail0, x_scale, w_scales[o]);
+        let mut v1 = finalize_int8(hsum_epi32(acc1), w_sums[o + 1], tail1, x_scale, w_scales[o + 1]);
+
+        if let Some(b) = bias { v0 += b[o]; v1 += b[o + 1]; }
+        y[o] = v0;
+        y[o + 1] = v1;
+        o += 2;
+    }
+
+    // Handle remaining odd row
+    while o < out_dim {
+        let w_row = w_int8.add(o * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let x = _mm256_loadu_si256(x_int8.add(k) as *const __m256i);
+            let xu = _mm256_xor_si256(x, sf256);
+            acc0 = dot_i8_avx2_acc_256v2(acc0, xu,
+                _mm256_loadu_si256(w_row.add(k) as *const __m256i), ones256);
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            acc0 = dot_i8_avx2_acc_256(acc0, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i), _mm_setzero_si128(), ones256);
+            k += 16;
+        }
+
+        let tail = dot_i8_tail(x_int8, w_row, k, in_dim);
+        let mut val = finalize_int8(hsum_epi32(acc0), w_sums[o], tail, x_scale, w_scales[o]);
+        if let Some(b) = bias { val += b[o]; }
+        y[o] = val;
+        o += 1;
+    }
+}
+
+/// VNNI INT8 matvec: `y = W_int8 @ x_int8 * (x_scale * w_scales[row])`
+/// Uses vpdpbusd (AVX-VNNI) for native i8*i8 dot products.
+/// Only available on CPUs with AVX-VNNI (Alder Lake+, Zen 4+).
+///
+/// # Safety
+/// Uses AVX2 + AVX-VNNI intrinsics. Caller must ensure CPU supports VNNI.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avxvnni")]
+pub unsafe fn matvec_int8_vnni(
+    y: &mut [f32], x_int8: *const i8, x_scale: f32,
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
+    bias: Option<&[f32]>,
+    in_dim: usize, out_dim: usize,
+) {
+    let sf = sign_flip_256();
+    let sf128 = sign_flip_128();
+    let mut o = 0usize;
+
+    // Process 2 output rows at a time
+    while o + 1 < out_dim {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let x0 = _mm_loadu_si128(x_int8.add(k) as *const __m128i);
+            let x1 = _mm_loadu_si128(x_int8.add(k + 16) as *const __m128i);
+            let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
+
+            acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w0.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w0.add(k) as *const __m128i)));
+            acc1 = dot_i8_vnni_acc(acc1, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w1.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w1.add(k) as *const __m128i)));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            let xu256 = _mm256_set_m128i(_mm_setzero_si128(), xu);
+            acc0 = dot_i8_vnni_acc(acc0, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w0.add(k) as *const __m128i)));
+            acc1 = dot_i8_vnni_acc(acc1, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w1.add(k) as *const __m128i)));
+            k += 16;
+        }
+
+        let tail0 = dot_i8_tail(x_int8, w0, k, in_dim);
+        let tail1 = dot_i8_tail(x_int8, w1, k, in_dim);
+
+        let mut v0 = finalize_int8(hsum_epi32(acc0), w_sums[o], tail0, x_scale, w_scales[o]);
+        let mut v1 = finalize_int8(hsum_epi32(acc1), w_sums[o + 1], tail1, x_scale, w_scales[o + 1]);
+
+        if let Some(b) = bias { v0 += b[o]; v1 += b[o + 1]; }
+        y[o] = v0;
+        y[o + 1] = v1;
+        o += 2;
+    }
+
+    // Handle remaining odd row
+    while o < out_dim {
+        let w_row = w_int8.add(o * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let x0 = _mm_loadu_si128(x_int8.add(k) as *const __m128i);
+            let x1 = _mm_loadu_si128(x_int8.add(k + 16) as *const __m128i);
+            let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
+            acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w_row.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i)));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            let xu256 = _mm256_set_m128i(_mm_setzero_si128(), xu);
+            acc0 = dot_i8_vnni_acc(acc0, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i)));
+            k += 16;
+        }
+
+        let tail = dot_i8_tail(x_int8, w_row, k, in_dim);
+        let mut val = finalize_int8(hsum_epi32(acc0), w_sums[o], tail, x_scale, w_scales[o]);
+        if let Some(b) = bias { val += b[o]; }
+        y[o] = val;
+        o += 1;
+    }
+}
+
+/// AVX2 INT8 argmax: find argmax of x @ W.T where W is int8-quantized.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn argmax_int8_range_avx2(
+    x_int8: *const i8, x_scale: f32,
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
+    in_dim: usize, start: usize, end: usize,
+) -> (usize, f32) {
+    let sf = sign_flip_128();
+    let mut best = start;
+    let mut best_val = -1e30f32;
+    let mut o = start;
+
+    while o + 1 < end {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let xu_lo = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf);
+            let xu_hi = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k + 16) as *const __m128i), sf);
+            acc0 = dot_i8_avx2_acc(acc0, xu_lo, xu_hi,
+                _mm_loadu_si128(w0.add(k) as *const __m128i),
+                _mm_loadu_si128(w0.add(k + 16) as *const __m128i));
+            acc1 = dot_i8_avx2_acc(acc1, xu_lo, xu_hi,
+                _mm_loadu_si128(w1.add(k) as *const __m128i),
+                _mm_loadu_si128(w1.add(k + 16) as *const __m128i));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf);
+            acc0 = dot_i8_avx2_acc(acc0, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w0.add(k) as *const __m128i), _mm_setzero_si128());
+            acc1 = dot_i8_avx2_acc(acc1, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w1.add(k) as *const __m128i), _mm_setzero_si128());
+            k += 16;
+        }
+
+        let tail0 = dot_i8_tail(x_int8, w0, k, in_dim);
+        let tail1 = dot_i8_tail(x_int8, w1, k, in_dim);
+        let val0 = finalize_int8(hsum_epi32(acc0), w_sums[o], tail0, x_scale, w_scales[o]);
+        let val1 = finalize_int8(hsum_epi32(acc1), w_sums[o + 1], tail1, x_scale, w_scales[o + 1]);
+
+        if val0 > best_val { best_val = val0; best = o; }
+        if val1 > best_val { best_val = val1; best = o + 1; }
+        o += 2;
+    }
+
+    while o < end {
+        let w_row = w_int8.add(o * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let xu_lo = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf);
+            let xu_hi = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k + 16) as *const __m128i), sf);
+            acc0 = dot_i8_avx2_acc(acc0, xu_lo, xu_hi,
+                _mm_loadu_si128(w_row.add(k) as *const __m128i),
+                _mm_loadu_si128(w_row.add(k + 16) as *const __m128i));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf);
+            acc0 = dot_i8_avx2_acc(acc0, xu, _mm_setzero_si128(),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i), _mm_setzero_si128());
+            k += 16;
+        }
+
+        let tail = dot_i8_tail(x_int8, w_row, k, in_dim);
+        let val = finalize_int8(hsum_epi32(acc0), w_sums[o], tail, x_scale, w_scales[o]);
+        if val > best_val { best_val = val; best = o; }
+        o += 1;
+    }
+
+    (best, best_val)
+}
+
+/// VNNI INT8 argmax: find argmax of x @ W.T using AVX-VNNI.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avxvnni")]
+pub unsafe fn argmax_int8_range_vnni(
+    x_int8: *const i8, x_scale: f32,
+    w_int8: *const i8, w_scales: &[f32], w_sums: &[i32],
+    in_dim: usize, start: usize, end: usize,
+) -> (usize, f32) {
+    let sf = sign_flip_256();
+    let sf128 = sign_flip_128();
+    let mut best = start;
+    let mut best_val = -1e30f32;
+    let mut o = start;
+
+    while o + 1 < end {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let x0 = _mm_loadu_si128(x_int8.add(k) as *const __m128i);
+            let x1 = _mm_loadu_si128(x_int8.add(k + 16) as *const __m128i);
+            let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
+            acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w0.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w0.add(k) as *const __m128i)));
+            acc1 = dot_i8_vnni_acc(acc1, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w1.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w1.add(k) as *const __m128i)));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            let xu256 = _mm256_set_m128i(_mm_setzero_si128(), xu);
+            acc0 = dot_i8_vnni_acc(acc0, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w0.add(k) as *const __m128i)));
+            acc1 = dot_i8_vnni_acc(acc1, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w1.add(k) as *const __m128i)));
+            k += 16;
+        }
+
+        let tail0 = dot_i8_tail(x_int8, w0, k, in_dim);
+        let tail1 = dot_i8_tail(x_int8, w1, k, in_dim);
+        let val0 = finalize_int8(hsum_epi32(acc0), w_sums[o], tail0, x_scale, w_scales[o]);
+        let val1 = finalize_int8(hsum_epi32(acc1), w_sums[o + 1], tail1, x_scale, w_scales[o + 1]);
+
+        if val0 > best_val { best_val = val0; best = o; }
+        if val1 > best_val { best_val = val1; best = o + 1; }
+        o += 2;
+    }
+
+    while o < end {
+        let w_row = w_int8.add(o * in_dim);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut k = 0usize;
+
+        while k + 32 <= in_dim {
+            let x0 = _mm_loadu_si128(x_int8.add(k) as *const __m128i);
+            let x1 = _mm_loadu_si128(x_int8.add(k + 16) as *const __m128i);
+            let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
+            acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
+                _mm_loadu_si128(w_row.add(k + 16) as *const __m128i),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i)));
+            k += 32;
+        }
+        while k + 16 <= in_dim {
+            let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
+            let xu256 = _mm256_set_m128i(_mm_setzero_si128(), xu);
+            acc0 = dot_i8_vnni_acc(acc0, xu256, _mm256_set_m128i(_mm_setzero_si128(),
+                _mm_loadu_si128(w_row.add(k) as *const __m128i)));
+            k += 16;
+        }
+
+        let tail = dot_i8_tail(x_int8, w_row, k, in_dim);
+        let val = finalize_int8(hsum_epi32(acc0), w_sums[o], tail, x_scale, w_scales[o]);
+        if val > best_val { best_val = val; best = o; }
+        o += 1;
+    }
+
+    (best, best_val)
+}
+
 /// AVX2-accelerated SwiGLU with interleaved gate/up.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]

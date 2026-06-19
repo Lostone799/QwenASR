@@ -38,3 +38,19 @@ This document catalogs the performance optimizations implemented in the pure-Rus
 - **Silence Compaction**: Energy-based VAD preprocesses audio to strip non-speech segments. Edge padding is reduced to 2 windows and extra non-voice hangover is eliminated, minimizing data sent to the encoder.
 - **Lazy Encoder Re-encoding**: In streaming mode, the partial encoder tail is only re-encoded every other chunk. This provides near-perfect Longest Common Prefix (LCP) reuse and reduces decoder prefill cost by ~50% on skipped chunks.
 - **Online Softmax**: Single-token causal attention uses an online softmax scan, combining score tracking, normalization, and value accumulation into a single loop. This avoids temporary score buffer allocations and separate exponentiation passes for `seq_len = 1` queries.
+
+## 6. Windows x86 (AVX2) Optimizations
+
+- **AVX2 INT8 GEMM Kernel**: PMADDUBSW (u8×s8→i16) + PMADDWD (i16×i16→i32) + XOR 0x80 sign-flip compensation. 4-row batched kernel for cache efficiency.
+- **OpenBLAS Thread Tuning**: 8 OpenBLAS threads optimal with 12-thread custom pool (2/3 ratio). Environment variable `OPENBLAS_NUM_THREADS` set in `main()` before any BLAS call (DLL only exports `cblas_sgemm`).
+- **Tiled INT8 GEMM**: Outer loop = o_block (4 output rows), inner loop = tokens. Weights loaded once per o_block and reused across all tokens, reducing weight memory traffic from `seq_len × out_dim × in_dim` to `out_dim × in_dim`.
+- **Fused QKV Quantization**: Quantize input activation once, reuse for Q/K/V projections. Saves 2/3 of quantization cost (memory alloc + compute). Both encoder (same out_dim, with bias) and decoder (GQA: q_dim/kv_dim, no bias) variants.
+- **Result**: sgemm -91.8%, realtime 1.03x → 3.56x on 1.7B model (28.2s audio).
+
+## 7. Experience Knowledge Base
+
+See [experience-ledger.md](experience-ledger.md) for the complete optimization experience knowledge base, including:
+- Success stories and failure lessons across all platforms
+- Performance evolution data (Apple M5 + Windows x86)
+- Platform-specific pitfalls and best practices
+- Continuous update mechanism for future optimizations

@@ -6,7 +6,9 @@ use qwen_asr::{audio, config, context, kernels, transcribe, align};
 use config::*;
 use context::QwenCtx;
 
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -146,6 +148,15 @@ fn parse_past_text_mode(s: &str) -> Option<i32> {
 }
 
 fn main() {
+    // Set OpenBLAS thread count early (before any BLAS call).
+    // Benchmark: 8 threads optimal with 12-thread custom pool.
+    #[cfg(all(feature = "blas", target_os = "windows"))]
+    unsafe {
+        if std::env::var("OPENBLAS_NUM_THREADS").is_err() {
+            std::env::set_var("OPENBLAS_NUM_THREADS", "8");
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     // Handle `download` subcommand: qwen-asr download [args...]
@@ -173,11 +184,13 @@ fn main() {
     let mut verbosity = 1i32;
     let mut use_stdin = false;
     let mut live_mode = false;
+    #[allow(unused_variables)]
     let mut device_name: Option<String> = None;
     let mut n_threads = 0i32;
     let mut segment_sec: f32 = -1.0;
     let mut search_sec: f32 = -1.0;
     let mut stream_mode = false;
+    #[allow(unused_variables)]
     let mut vad_mode = false;
     let mut stream_max_new_tokens: i32 = -1;
     let mut stream_chunk_sec: f32 = -1.0;
@@ -220,7 +233,8 @@ fn main() {
                 stream_mode = true;
             }
             "--vad" => {
-                vad_mode = true;
+                #[allow(unused_assignments)]
+                { vad_mode = true; }
             }
             "--stream-max-new-tokens" => {
                 i += 1;
@@ -283,7 +297,8 @@ fn main() {
             }
             "--device" => {
                 i += 1;
-                device_name = args.get(i).cloned();
+                #[allow(unused_assignments)]
+                { device_name = args.get(i).cloned(); }
             }
             "--list-devices" => {
                 // Already handled above, but don't error

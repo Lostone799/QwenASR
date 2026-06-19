@@ -10,6 +10,17 @@ fn main() {
             "linux" => {
                 println!("cargo:rustc-link-lib=openblas");
             }
+            "windows" => {
+                // OpenBLAS for Windows: link against openblas.lib (import lib for libopenblas.dll)
+                // The DLL name is libopenblas.dll, but we link with the import lib named openblas.lib
+                println!("cargo:rustc-link-lib=dylib=openblas");
+                // Add search path for the OpenBLAS library
+                let openblas_dir = std::env::var("OPENBLAS_DIR").unwrap_or_else(|_| {
+                    // Default path
+                    "C:\\Users\\Administrator\\clawd\\openblas".to_string()
+                });
+                println!("cargo:rustc-link-search=native={}", openblas_dir);
+            }
             _ => {
                 // No BLAS available, will use fallback matmul
             }
