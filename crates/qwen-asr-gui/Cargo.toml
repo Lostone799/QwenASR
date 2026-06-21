@@ -1,0 +1,18 @@
+[package]
+name = "qwen-asr-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GUI for qwen-asr: Qwen3-ASR speech-to-text"
+
+[[bin]]
+name = "qwen-asr-gui"
+path = "src/main.rs"
+
+[dependencies]
+qwen-asr = { workspace = true, default-features = false, features = ["blas"] }
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
+pollster = "0.3"
+cpal = "0.15"

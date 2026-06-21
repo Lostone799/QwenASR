@@ -47,6 +47,24 @@
 - **Fused QKV 量化**: 量化输入激活一次，复用给 Q/K/V 三个投影。节省 2/3 量化开销（内存分配 + 计算）。编码器（相同 out_dim，带 bias）和解码器（GQA: q_dim/kv_dim，无 bias）两个变体。
 - **效果**: sgemm -91.8%，realtime 1.03x → 3.56x（1.7B 模型，28.2s 音频）。
 
+## 6a. AVX-VNNI 微架构白名单 (2026-06-21)
+
+部分 Intel 平台和虚拟机在 CPUID 中报告 `avxvnni=1`，但**没有** `vpdpbusd` 执行单元。一旦执行该指令，会触发 `EXCEPTION_ILLEGAL_INSTRUCTION (0xC000001D)`。最常见的误报是 **Intel N95/N100/N305（Alder Lake-N Gracemont, family 6, model 0x9A）**：纯 E-core，没有 AVX-VNNI 硬件。混合架构 Intel CPU 和 Hyper-V 虚拟机在调度器压力下也常出现类似误报。
+
+`crates/qwen-asr/src/kernels/mod.rs` 中采用两层防护：
+
+- **环境变量门控**（用户手动覆盖）：
+  - `QWEN_ASR_DISABLE_VNNI=1` — 强制走 AVX2 路径
+  - `QWEN_ASR_ENABLE_VNNI=1` — 强制走 VNNI（仅当你确认 CPU 有此单元；绕过白名单）
+- **裸 CPUID 微架构白名单**（`vnni_capable_cpu()`）：
+  - 实现用 `core::arch::asm!` 直接读 CPUID（stable Rust 不暴露 `__get_cpuid`）
+  - 白名单含 Intel 12/13/14 代 P-core、Meteor Lake、Lunar Lake、Arrow Lake、Sapphire / Emerald / Granite Rapids、Sierra Forest、AMD Zen 4+（family 25）
+  - **显式排除** Gracemont（N95/N100/N305 0x9A）和所有不在白名单中的微架构
+  - 判定逻辑：`allowed = (白名单命中 && CPUID=yes)` — 两者必须同时满足。CPUID 报告有但不在白名单 = 视为误报
+  - 首次调用会把实际 `(cpuid_yes, 白名单命中, env_off, env_on)` 元组打到 stderr，便于 SEH 报告自解释
+
+判定结果缓存在 `AtomicU8` 中，首次调用后不再开销。每次进程只有 1 次 CPUID 开销。
+
 ## 7. 经验知识库
 
 详见 [experience-ledger.md](experience-ledger.md)，包含：
@@ -54,3 +72,19 @@
 - 性能演进数据（Apple M5 + Windows x86）
 - 平台特定陷阱与最佳实践
 - 后续优化的持续更新机制
+
+## 8. 长音频 Token 预算修复 (2026-06-21)
+
+`crates/qwen-asr/src/transcribe.rs` 中的硬截断 bug：
+
+- **修复前**：两个常量 `LONG_AUDIO_FAST_CAP_SEC = 15` 和
+  `LONG_AUDIO_FAST_MAX_TOKENS = 6` 把**任何**超过 15 秒的音频硬截到 6 个 token。
+  在 P-core CPU 上（~100ms/token）这个限制几乎无感（多 1 秒）。
+  在 N95 上（2-3s/token）就表现为 "20 秒音频 → 9 个汉字就停" — 实际是 decode *跑完了*，只是被硬截了。
+- **修复后**：删除两个常量。Token 预算改为
+  `max(30, audio_sec * 8.0)`，对所有长度一致应用。
+  配套 `LONG_AUDIO_TOKEN_RATE = 8.0`（tokens / 秒）和
+  `LONG_AUDIO_TOKEN_MIN = 30`（极短音频下限）。
+- **流式路径**：流式 chunk 的同名 6-token cap 也删了。流式的长音频由 chunked / LCP-reuse 机制（`stream_push_audio`）处理，不再用全局 token cap。
+
+P1 级修复（正确性而非速度）：用户在长音频下拿到完整文本，而不是 6-9 token 的硬截断。

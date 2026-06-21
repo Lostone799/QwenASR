@@ -21,8 +21,20 @@ const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
-const LONG_AUDIO_FAST_CAP_SEC: usize = 15;
-const LONG_AUDIO_FAST_MAX_TOKENS: i32 = 6;
+// P0 fix (2026-06-21): for any input above 15 seconds the decoder was
+// previously capped at 6 tokens (`LONG_AUDIO_FAST_MAX_TOKENS`), which on
+// slow CPUs (e.g. Intel N95 / Gracemont, ~2-3 s per token) translates
+// to ~6 Chinese characters of output and appears to the user as
+// "识别卡在 9 个字". The fast-path was originally tuned for P-core
+// CPUs where 6 tokens is acceptable; on E-core it is unusable.
+//
+// We now scale the token cap with audio duration for ALL lengths
+// (the previous 15 s boundary is removed). 8 tokens / second matches
+// the rule used in stt-lite and is enough for any Chinese speech
+// rate. Users on a P-core CPU who hit a slow decode can still cap
+// the result with the GUI's `stream_max_new_tokens` parameter.
+const LONG_AUDIO_TOKEN_RATE: f64 = 8.0;
+const LONG_AUDIO_TOKEN_MIN: i32 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrefillRowKey {
@@ -171,6 +183,7 @@ fn transcribe_segment(
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
     let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb_vocab = ctx.decoder.tok_embeddings_vocab;
 
     // Embed prefix head
     let mut off = 0;
@@ -181,6 +194,7 @@ fn transcribe_segment(
                 tok_emb,
                 tok,
                 dim,
+                tok_emb_vocab,
             )
         };
         off += 1;
@@ -195,6 +209,7 @@ fn transcribe_segment(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
             off += 1;
@@ -209,6 +224,7 @@ fn transcribe_segment(
                 tok_emb,
                 tok,
                 dim,
+                tok_emb_vocab,
             )
         };
         off += 1;
@@ -229,6 +245,7 @@ fn transcribe_segment(
                 tok_emb,
                 tok,
                 dim,
+                tok_emb_vocab,
             )
         };
     }
@@ -243,6 +260,7 @@ fn transcribe_segment(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
         }
@@ -258,6 +276,7 @@ fn transcribe_segment(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
         }
@@ -268,6 +287,7 @@ fn transcribe_segment(
                 tok_emb,
                 TOKEN_ASR_TEXT,
                 dim,
+                tok_emb_vocab,
             )
         };
     }
@@ -308,15 +328,13 @@ fn transcribe_segment(
 
     // Autoregressive decode
     let t0 = get_time_ms();
-    // Dynamic max_tokens: scale with audio duration (ref: stt-lite max(30, dur*8))
-    // Chinese speech rate ~5-6 chars/sec, BPE ~1.3-1.5 chars/token
-    // Coefficient 8 balances output length vs repetition risk
+    // Dynamic max_tokens: scale linearly with audio duration for all
+    // lengths. See comment on LONG_AUDIO_TOKEN_RATE for why the previous
+    // fast-path cap (6 tokens) was wrong on slow CPUs.
     let audio_sec = ctx.perf_audio_ms / 1000.0;
-    let max_tokens = if audio_sec > (LONG_AUDIO_FAST_CAP_SEC as f64) {
-        LONG_AUDIO_FAST_MAX_TOKENS
-    } else {
-        (30.0_f64.max(audio_sec * 8.0)) as i32
-    };
+    let max_tokens = (LONG_AUDIO_TOKEN_MIN as f64)
+        .max(audio_sec * LONG_AUDIO_TOKEN_RATE)
+        as i32;
     let mut n_generated = 0;
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
@@ -383,7 +401,7 @@ fn transcribe_segment(
             }
         }
 
-        unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim) };
+        unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim, tok_emb_vocab) };
         token = decoder::decoder_forward(
             &ctx.decoder,
             cfg,
@@ -755,14 +773,15 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
     let rollback = ctx.stream_rollback;
     let unfixed_chunks = ctx.stream_unfixed_chunks;
+    // Default 32 tokens per chunk is fine for streaming; we no longer
+    // cap at LONG_AUDIO_FAST_MAX_TOKENS for long inputs (that fast-path
+    // constant was 6 — a typo, see comment on LONG_AUDIO_TOKEN_RATE).
+    // Long audio is handled by the chunked / LCP-reuse path below.
     let mut max_new_tokens = if ctx.stream_max_new_tokens > 0 {
         ctx.stream_max_new_tokens
     } else {
         32
     };
-    if samples.len() > LONG_AUDIO_FAST_CAP_SEC * SAMPLE_RATE as usize {
-        max_new_tokens = max_new_tokens.min(LONG_AUDIO_FAST_MAX_TOKENS);
-    }
 
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
@@ -798,6 +817,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
 
     let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb_vocab = ctx.decoder.tok_embeddings_vocab;
 
     let mut raw_tokens: Vec<i32> = Vec::new();
     let mut stable_text_tokens: Vec<i32> = Vec::new();
@@ -914,6 +934,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
             prefill_keys[off] = prefill_token_key(tok);
@@ -927,6 +948,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                         tok_emb,
                         tok,
                         dim,
+                        tok_emb_vocab,
                     )
                 };
                 prefill_keys[off] = prefill_token_key(tok);
@@ -940,6 +962,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
             prefill_keys[off] = prefill_token_key(tok);
@@ -980,6 +1003,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 )
             };
             prefill_keys[suffix_off + i] = prefill_token_key(tok);
@@ -993,6 +1017,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                         tok_emb,
                         tok,
                         dim,
+                        tok_emb_vocab,
                     )
                 };
                 prefill_keys[suffix_off + SUFFIX_BASE.len() + i] = prefill_token_key(tok);
@@ -1007,6 +1032,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                     tok_emb,
                     raw_tokens[i],
                     dim,
+                    tok_emb_vocab,
                 )
             };
             prefill_keys[text_off + i] = prefill_token_key(raw_tokens[i]);
@@ -1061,7 +1087,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             }
             chunk_tokens.push(token);
             unsafe {
-                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
+                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim, tok_emb_vocab);
             }
             token = decoder::decoder_forward(
                 &ctx.decoder,
@@ -1339,6 +1365,7 @@ pub fn stream_push_audio(
     let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
     let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb_vocab = ctx.decoder.tok_embeddings_vocab;
     let mut tmp_embed = vec![0.0f32; dim];
     let mut delta_bytes: Vec<u8> = Vec::new();
 
@@ -1459,6 +1486,7 @@ pub fn stream_push_audio(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 );
             }
             prefill_keys[off] = prefill_token_key(tok);
@@ -1472,6 +1500,7 @@ pub fn stream_push_audio(
                         tok_emb,
                         tok,
                         dim,
+                        tok_emb_vocab,
                     );
                 }
                 prefill_keys[off] = prefill_token_key(tok);
@@ -1485,6 +1514,7 @@ pub fn stream_push_audio(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 );
             }
             prefill_keys[off] = prefill_token_key(tok);
@@ -1525,6 +1555,7 @@ pub fn stream_push_audio(
                     tok_emb,
                     tok,
                     dim,
+                    tok_emb_vocab,
                 );
             }
             prefill_keys[suffix_off + i] = prefill_token_key(tok);
@@ -1538,6 +1569,7 @@ pub fn stream_push_audio(
                         tok_emb,
                         tok,
                         dim,
+                        tok_emb_vocab,
                     );
                 }
                 prefill_keys[suffix_off + SUFFIX_BASE.len() + i] = prefill_token_key(tok);
@@ -1552,6 +1584,7 @@ pub fn stream_push_audio(
                     tok_emb,
                     state.raw_tokens[i],
                     dim,
+                    tok_emb_vocab,
                 );
             }
             prefill_keys[text_off + i] = prefill_token_key(state.raw_tokens[i]);
@@ -1615,7 +1648,7 @@ pub fn stream_push_audio(
             }
         chunk_tokens.push(token);
             unsafe {
-                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
+                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim, tok_emb_vocab);
             }
         token = decoder::decoder_forward(
                 &ctx.decoder,

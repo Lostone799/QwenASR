@@ -292,3 +292,155 @@ The biggest wins in this branch came from four themes:
 - Fusing residual adds and activation steps to cut memory traffic.
 - Using Accelerate BLAS/vDSP for dense linear algebra and vector math.
 - Making thread scheduling and SIMD kernels cheaper on Apple Silicon.
+
+---
+
+## Post-`5fd3fbd` work (2026-06-21)
+
+The following entries are **not** in the autoresearch/perf-opt-1 history
+above. They were applied as direct fixes to `main` after the C1
+commit `5fd3fbd`. They are correctness / stability fixes, not new
+optimization experiments.
+
+## gui-crash-hardening - Win32 SEH + bounds checks + poisoning recovery (P0/P1/P2)
+
+- Scope:
+  - `crates/qwen-asr-gui/src/seh.rs` (NEW)
+  - `crates/qwen-asr-gui/src/sync_ext.rs` (NEW)
+  - `crates/qwen-asr-gui/src/{main,worker,app,recorder,logger}.rs`
+  - `crates/qwen-asr/src/decoder.rs`
+  - `crates/qwen-asr/src/{transcribe,align}.rs`
+  - `crates/qwen-asr/src/kernels/mod.rs`
+- What changed (4-class fix):
+  - **P0 #1** `seh.rs` — top-level Win32 `SetUnhandledExceptionFilter`
+    that decodes `EXCEPTION_RECORD` (ACCESS_VIOLATION / STACK_OVERFLOW /
+    ILLEGAL_INSTRUCTION / INT_DIVIDE_BY_ZERO), writes
+    `logs/crash_<unix_secs>_<pid>.log`, and shows `MessageBoxW`. The
+    GUI binary uses `windows_subsystem = "windows"` which otherwise
+    hides OS-level access violations from the user. Installed **first**
+    in `main()`, before panic hook / logger init.
+  - **P0 #2** `tok_embed_bf16_to_f32` now takes `vocab_size: usize` and
+    returns `bool`. OOB / negative / dst-too-small all zero-init the
+    destination and log. The `Decoder` struct stores
+    `tok_embeddings_vocab` derived from the safetensors shape. All 28
+    call sites in `transcribe.rs` / `align.rs` updated.
+  - **P1 #1** `safe_lock()` / `try_safe_lock()` in `sync_ext.rs`
+    recover from `Mutex` poisoning transparently (backed by
+    `logger::log_warn`). Replaced 22 `.lock().unwrap()` call sites
+    across `worker.rs`, `app.rs`, `recorder.rs`, `logger.rs`.
+  - **P1 #2** `pool_worker` wraps the user closure in
+    `panic::catch_unwind(AssertUnwindSafe(...))` so a single bad kernel
+    cannot stall `parallel_for` (which spins waiting for `n-1` done
+    signals after killing one thread).
+  - **P2** `AsrWorker::cancel_in_flight()` properly joins the previous
+    `JoinHandle` before spawning a new task. Previously
+    `self.handle.take()` silently abandoned the prior worker, leading
+    to races on shared state.
+- Why it matters: the user reported the GUI crashed with
+  `EXCEPTION_ACCESS_VIOLATION` and `EXCEPTION_ILLEGAL_INSTRUCTION` on
+  Intel N95 with no log output (because of the windows subsystem).
+  Without the SEH filter, the user had no way to diagnose the issue.
+  The SEH filter's first real-world capture was the N95 VNNI crash
+  (next entry below).
+- Recorded result: verified end-to-end — real SEH captures have been
+  written to `<exe_dir>/logs/crash_<ts>_<pid>.log` and the MessageBoxW
+  has fired. `cargo check --workspace --all-targets` clean,
+  `cargo test -p qwen-asr --lib` 9/9 pass.
+
+## vnni-allowlist - Intel N95 / hybrid / VM AVX-VNNI false-positive fix
+
+- Scope: `crates/qwen-asr/src/kernels/mod.rs`
+- What changed:
+  - `vnni_allowed()` reads `QWEN_ASR_DISABLE_VNNI` / `QWEN_ASR_ENABLE_VNNI`
+    env vars, caches the result in an `AtomicU8`.
+  - `vnni_capable_cpu()` runs raw `CPUID` via `core::arch::asm!` and
+    consults a microarchitecture allowlist (Intel 12/13/14-gen P-cores,
+    Meteor / Lunar / Arrow Lake, Sapphire / Emerald / Granite Rapids,
+    Sierra Forest, AMD Zen 4+ family 25). Explicitly excludes
+    Gracemont 0x9A (N95/N100/N305) and any other microarchitecture.
+  - Decision: `allowed = (allowlist_ok && cpuid_yes)`. CPUID-yes on a
+    non-allowlisted core is treated as a false positive.
+  - First call logs `(cpuid_yes, allowlist_ok, env_off, env_on)` to
+    stderr so future crash reports are self-explaining.
+- Why it matters: `is_x86_feature_detected!("avxvnni")` reports
+  `true` on N95's CPUID, but the silicon lacks the `vpdpbusd` unit.
+  Any execution traps as `EXCEPTION_ILLEGAL_INSTRUCTION (0xC000001D)`.
+  The same false-positive pattern affects hybrid Intel CPUs
+  (CPUID reports the union of all core features; the OS scheduler
+  can land the hot loop on a Gracemont E-core) and Hyper-V VMs.
+- Why raw `asm!`: stable Rust does not expose `__get_cpuid`
+  non-nightly, so a manual `mov eax, 7; cpuid; ...` block is used.
+  `ebx` is the LLVM-reserved base pointer, so it is captured via
+  `lateout(reg) ebx_out` plus an explicit `mov {ebx_out:e}, ebx` in
+  the asm template.
+- Recorded result: user verified on Intel N95 —
+  `$env:QWEN_ASR_DISABLE_VNNI="1"; .\qwen-asr-gui.exe` no longer
+  crashes and produces transcription. Without the env var, the SEH
+  filter captures the crash and writes a report identifying the
+  problem as "VNNI attempted on non-allowlisted core".
+
+## long-audio-token-budget - 9-char truncation fix
+
+- Scope: `crates/qwen-asr/src/transcribe.rs`
+- What changed: deleted `LONG_AUDIO_FAST_CAP_SEC = 15` and
+  `LONG_AUDIO_FAST_MAX_TOKENS = 6`. Replaced with
+  `LONG_AUDIO_TOKEN_RATE = 8.0` (tokens / second) and
+  `LONG_AUDIO_TOKEN_MIN = 30` (floor for short audio). All audio
+  lengths now use `max(30, audio_sec * 8.0)`. The matching 6-token
+  cap on the streaming chunk path was also removed.
+- Why it matters: the old code truncated *any* decode whose audio
+  exceeded 15 s to 6 tokens. On a P-core CPU at ~100 ms / token the
+  cap was effectively unobservable (≤ 1 s extra). On a slow CPU
+  like N95 (2-3 s / token), the cap surfaced as "20 s audio → 9
+  Chinese chars and stops" — the decode *completed*, it just
+  stopped early. This looked like a model failure to the user.
+- Recorded result: user verified on N95 — 20 s audio now produces
+  the full expected transcript instead of 9 chars. (N95 raw speed
+  remains 2-3 tokens / second because the cap was masking the
+  actual decode, not because the decoder was slow.)
+
+## n95-profile-collectors - PowerShell scripts to gather N95 profile data
+
+- Scope: project root — `profile_n95.ps1` (NEW), `profile_simulated_n95.ps1` (NEW)
+- What changed: two one-shot scripts that run the same 4 CLI variants
+  (baseline / t2 / t2_blas1 / t1) with `--profile`, dump stderr to
+  `<label>.txt`, and print the last 25 lines to console. Both
+  scripts set `QWEN_ASR_DISABLE_VNNI=1`. The simulated variant also
+  pins the process to 2 cores via `SetProcessAffinityMask` and
+  drops priority to `BelowNormal` to emulate N95 TDP throttling.
+- Why it matters: there are **zero** N95 / Gracemont E-core
+  benchmarks in the existing optimization matrix. All current
+  rules of thumb (8 BLAS threads on 12-core pool, default to
+  P-cores on Apple) are P-core assumptions and do not transfer.
+  Before any N95-specific optimization is proposed, the real
+  per-kernel breakdown is needed. Output: `profile_n95_<label>.txt`
+  from the real machine and `profile_simn95_<label>.txt` from the
+  dev box. Both should be compared: kernel **percentages** should
+  match (algorithm + data flow), absolute **milliseconds** will
+  differ by ~5-8x (P-core per-clock throughput + clock speed).
+- Recorded result: scripts shipped, no benchmark data yet (waiting
+  on user to run on N95).
+
+## iGPU offload - rejected
+
+- Scope: not implemented
+- What was proposed: use Intel UHD (Gen 12 Xe-LP, 16 EU, 256 GFLOPS
+  FP16) on N95 to offload ASR compute.
+- Why it is rejected:
+  1. **算力倒挂**: UHD 256 GFLOPS FP16 < CPU INT8 等效 ~1.5 TOPS
+     (AVX2 PMADDUBSW path). iGPU is 6x slower than the CPU path
+     the engine already takes.
+  2. **带宽共享**: N95 单通道 DDR5 ~25 GB/s. iGPU 跟 CPU 共享
+     同一根内存条,没有 GPU 该有的"带宽放大"红利.
+  3. **算子形态不匹配**: Qwen3-ASR 算子 = GEMV / 小 GEMM
+     (Q/K/V 投影 1×N × N×K). GPU kernel 启动开销 100μs vs
+     算子本身 50μs,**负优化**.
+  4. **生态**: whisper.cpp / llama.cpp / rknn 全部不支持集显
+     ASR 加速. community consensus: 集显做 ASR = 慢.
+  5. **本项目架构**: 整个 `crates/qwen-asr` 没有任何
+     wgpu / OpenCL / Level Zero / DirectML 依赖. 纯 Rust +
+     OpenBLAS.
+- Exception (not applicable here): Apple M-series iGPU (统一内存
+  + 大规模 EU + Metal) IS supported via `vDSP/Accelerate` and is
+  documented in `docs/optimizations/overview.md` § 1 / § 3.
+- Recorded result: N/A — proposal rejected, no code written.

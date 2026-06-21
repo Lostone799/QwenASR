@@ -47,6 +47,39 @@ This document catalogs the performance optimizations implemented in the pure-Rus
 - **Fused QKV Quantization**: Quantize input activation once, reuse for Q/K/V projections. Saves 2/3 of quantization cost (memory alloc + compute). Both encoder (same out_dim, with bias) and decoder (GQA: q_dim/kv_dim, no bias) variants.
 - **Result**: sgemm -91.8%, realtime 1.03x → 3.56x on 1.7B model (28.2s audio).
 
+## 6a. AVX-VNNI microarchitecture allowlist (2026-06-21)
+
+Some Intel / VM platforms report `avxvnni=1` in CPUID but do **not** have the
+`vpdpbusd` execution unit. Hitting that path traps as
+`EXCEPTION_ILLEGAL_INSTRUCTION (0xC000001D)`. The most common false
+positive is **Intel N95/N100/N305 (Alder Lake-N Gracemont, family 6,
+model 0x9A)**: a pure E-core chip with no AVX-VNNI silicon. Hybrid Intel
+chips and Hyper-V VMs can land the hot loop on a similar false-positive
+core under scheduler pressure.
+
+Two-layer mitigation in `crates/qwen-asr/src/kernels/mod.rs`:
+
+- **Environment gate** (manual override for any user):
+  - `QWEN_ASR_DISABLE_VNNI=1` — force AVX2 path.
+  - `QWEN_ASR_ENABLE_VNNI=1` — force VNNI (use only if you know your CPU
+    has it; bypasses the allowlist).
+- **Raw CPUID allowlist** in `vnni_capable_cpu()`:
+  - Implementation uses `core::arch::asm!` to read CPUID directly, since
+    stable Rust does not expose `__get_cpuid` non-nightly.
+  - Allowlist includes Intel 12/13/14th-gen P-cores, Meteor Lake, Lunar
+    Lake, Arrow Lake, Sapphire / Emerald / Granite Rapids, Sierra
+    Forest, and AMD Zen 4+ (family 25).
+  - **Excludes** Gracemont (N95/N100/N305 0x9A) and any
+    microarchitecture not explicitly in the allowlist.
+  - Decision logic: `allowed = (allowlist_ok && cpuid_yes)` — both must
+    agree. A CPUID-yes on a non-allowlisted core is treated as a false
+    positive. First call logs the actual
+    `(cpuid_yes, allowlist_ok, env_off, env_on)` tuple to stderr so
+    crash reports are self-explaining.
+
+The decision is cached in an `AtomicU8` after the first call. Cost:
+one CPUID instruction, paid once per process.
+
 ## 7. Experience Knowledge Base
 
 See [experience-ledger.md](experience-ledger.md) for the complete optimization experience knowledge base, including:
@@ -54,3 +87,25 @@ See [experience-ledger.md](experience-ledger.md) for the complete optimization e
 - Performance evolution data (Apple M5 + Windows x86)
 - Platform-specific pitfalls and best practices
 - Continuous update mechanism for future optimizations
+
+## 8. Long-Audio Token Budget (2026-06-21)
+
+Long-audio token-budget fix in `crates/qwen-asr/src/transcribe.rs`:
+
+- **Before**: separate `LONG_AUDIO_FAST_CAP_SEC = 15` and
+  `LONG_AUDIO_FAST_MAX_TOKENS = 6` constants hard-capped **any** decode
+  whose audio exceeded 15 s to 6 tokens. On a P-core CPU at ~100 ms /
+  token, the cap was effectively unobservable (≤ 1 s extra). On a slow
+  CPU like N95 (2-3 s / token) the cap surfaced as "20 s audio → 9
+  Chinese chars and stops" — the decode *completed*, it just stopped
+  early. This looked like a model failure to the user.
+- **After**: removed both constants. The token budget is now
+  `max(30, audio_sec * 8.0)` applied uniformly to all audio lengths,
+  with `LONG_AUDIO_TOKEN_RATE = 8.0` (tokens / second) and
+  `LONG_AUDIO_TOKEN_MIN = 30` (floor for very short audio).
+- **Streaming path**: the matching 6-token cap on stream chunks was
+  removed too. Long audio in streaming is handled by the chunked /
+  LCP-reuse mechanism (`stream_push_audio`), not by a global token cap.
+
+This is a P1-class fix (correctness, not speed): the user gets the full
+text on long audio instead of a hard 6-9 token truncation.

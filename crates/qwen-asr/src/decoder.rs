@@ -44,7 +44,7 @@ fn quantize_to_superpage(
     out_dim: usize,
     in_dim: usize,
 ) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
-    let (int8, scales, w_sums) = kernels::quantize_bf16_weights_to_int8(w_bf16, out_dim, in_dim);
+    let (int8, scales, w_sums) = unsafe { kernels::quantize_bf16_weights_to_int8(w_bf16, out_dim, in_dim) };
     let mut sp = superpage_vec::<i8>(int8.len());
     sp.copy_from_slice(&int8);
     (sp, scales, w_sums)
@@ -298,6 +298,10 @@ unsafe impl Sync for DecLayer {}
 
 pub struct Decoder {
     pub tok_embeddings_bf16: *const u16,
+    /// Number of rows in the token embedding table (vocab size). Bounds-checks
+    /// in `tok_embed_bf16_to_f32` use this to catch out-of-range token IDs
+    /// before they cause a raw-pointer OOB read.
+    pub tok_embeddings_vocab: usize,
     pub layers: Vec<DecLayer>,
     pub norm: Vec<f32>,
     /// Separate lm_head for forced aligner (None = tied weights with tok_embeddings)
@@ -456,6 +460,20 @@ fn load_dec_layer(ms: &MultiSafetensors, cfg: &QwenConfig, i: usize, cache: Opti
 impl Decoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig, model_dir: &str) -> Option<Self> {
         let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
+        // Vocab size = embedding table's first dim. Used to bounds-check
+        // tok_embed_bf16_to_f32 so a bad token ID can never read past the
+        // allocation (which would surface as EXCEPTION_ACCESS_VIOLATION on
+        // Windows when called from a #![windows_subsystem] GUI).
+        let tok_embeddings_vocab = ms
+            .find("thinker.model.embed_tokens.weight")
+            .map(|(_shard_idx, t)| {
+                if t.shape.is_empty() {
+                    0
+                } else {
+                    t.shape[0] as usize
+                }
+            })
+            .unwrap_or(0);
 
         // Try loading INT8 cache to skip quantization
         let cache_path = format!("{}/.int8_cache.bin", model_dir);
@@ -522,6 +540,7 @@ impl Decoder {
 
         Some(Decoder {
             tok_embeddings_bf16,
+            tok_embeddings_vocab,
             layers,
             norm,
             lm_head_bf16,
@@ -1234,16 +1253,69 @@ pub fn decoder_prefill_logits(
     logits
 }
 
-/// Convert a token embedding from bf16 to f32.
+/// Convert a token embedding from bf16 to f32 with full bounds checking.
+///
+/// `vocab_size` is the number of rows in the embedding table (i.e. the
+/// maximum valid `token_id + 1`). Pass `0` to disable the upper-bound check
+/// (preserves the original unsafe behavior for tests and special cases).
+///
+/// # Returns
+/// `true` on success. `false` if the destination is too small for `dim`,
+/// `token_id` is negative, or `token_id >= vocab_size`. On failure, `dst`
+/// is zeroed so the caller can continue with a neutral embedding instead
+/// of producing NaNs that would later crash the matmul kernels.
 ///
 /// # Safety
-/// tok_emb_bf16 must point to valid memory for at least (token_id + 1) * dim bf16 values.
+///
+/// `tok_emb_bf16` must point to valid memory for at least `vocab_size * dim`
+/// bf16 values (or, if `vocab_size == 0`, for at least `(token_id + 1) * dim`).
+/// The bounds check only validates against the supplied `vocab_size`; it
+/// cannot verify the underlying allocation.
 pub unsafe fn tok_embed_bf16_to_f32(
     dst: &mut [f32],
     tok_emb_bf16: *const u16,
     token_id: i32,
     dim: usize,
-) {
-    let src = unsafe { std::slice::from_raw_parts(tok_emb_bf16.add(token_id as usize * dim), dim) };
-    kernels::bf16_to_f32_buf(dst, src);
+    vocab_size: usize,
+) -> bool {
+    // Reject negative / oversized token IDs before they reach the raw pointer.
+    // We allow `token_id == 0` with `vocab_size == 0` (degenerate / test path)
+    // to keep callers that haven't plumbed vocab through yet working.
+    if token_id < 0 {
+        eprintln!(
+            "tok_embed_bf16_to_f32: rejected negative token_id={} dim={}",
+            token_id, dim
+        );
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+        return false;
+    }
+    let tid = token_id as usize;
+    if vocab_size > 0 && tid >= vocab_size {
+        eprintln!(
+            "tok_embed_bf16_to_f32: token_id={} out of range (vocab_size={}, dim={})",
+            token_id, vocab_size, dim
+        );
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+        return false;
+    }
+    if dst.len() < dim {
+        eprintln!(
+            "tok_embed_bf16_to_f32: destination too small: dst.len()={} < dim={}",
+            dst.len(),
+            dim
+        );
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
+        return false;
+    }
+    // Safe: the arithmetic is checked above, and the caller contract on
+    // tok_emb_bf16 validity is documented in the safety section.
+    let src = unsafe { std::slice::from_raw_parts(tok_emb_bf16.add(tid * dim), dim) };
+    kernels::bf16_to_f32_buf(&mut dst[..dim], src);
+    true
 }

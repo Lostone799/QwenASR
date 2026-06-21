@@ -115,6 +115,7 @@ fn usage(prog: &str) {
     eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
     eprintln!("\nOptions:");
     eprintln!("  -t <n>        Number of threads (default: performance cores)");
+    eprintln!("  --blas-threads <n>  OpenBLAS thread count (default: 4, try 8 for large GEMMs)");
     eprintln!("  -S <secs>     Segment target seconds (default: 0 = full-audio decode)");
     eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
     eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
@@ -149,11 +150,14 @@ fn parse_past_text_mode(s: &str) -> Option<i32> {
 
 fn main() {
     // Set OpenBLAS thread count early (before any BLAS call).
-    // Benchmark: 8 threads optimal with 12-thread custom pool.
+    // Default: 4 threads (benchmark matrix shows 4 slightly outperforms 8
+    // on 6C/12T due to reduced contention with custom INT8 kernels).
+    // Override with --blas-threads N or OPENBLAS_NUM_THREADS env var.
+    #[allow(unexpected_cfgs)]
     #[cfg(all(feature = "blas", target_os = "windows"))]
     unsafe {
         if std::env::var("OPENBLAS_NUM_THREADS").is_err() {
-            std::env::set_var("OPENBLAS_NUM_THREADS", "8");
+            std::env::set_var("OPENBLAS_NUM_THREADS", "4");
         }
     }
 
@@ -187,6 +191,7 @@ fn main() {
     #[allow(unused_variables)]
     let mut device_name: Option<String> = None;
     let mut n_threads = 0i32;
+    let mut blas_threads: i32 = 0; // 0 = auto (default from set_threads)
     let mut segment_sec: f32 = -1.0;
     let mut search_sec: f32 = -1.0;
     let mut stream_mode = false;
@@ -306,6 +311,10 @@ fn main() {
             "--profile" => {
                 profile = true;
             }
+            "--blas-threads" => {
+                i += 1;
+                blas_threads = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
             "--debug" => {
                 verbosity = 2;
             }
@@ -400,14 +409,21 @@ fn main() {
     }
     kernels::set_threads(n_threads as usize);
 
+    // Override BLAS thread count if specified via CLI
+    if blas_threads > 0 {
+        kernels::set_blas_threads(blas_threads as usize);
+    }
+
     // Print optimization info
     if verbosity >= 1 {
         let opts = qwen_asr::optimization_flags();
+        let blas_info = format!("BLAS {}t", kernels::get_blas_threads());
         eprintln!(
-            "Optimizations: {} | {} threads | {}",
+            "Optimizations: {} | {} threads | {} | {}",
             opts.join(", "),
             n_threads,
             std::env::consts::ARCH,
+            blas_info,
         );
     }
 

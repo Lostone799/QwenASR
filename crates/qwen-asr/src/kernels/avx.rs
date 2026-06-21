@@ -485,8 +485,8 @@ pub unsafe fn layer_norm_row(out: &mut [f32], x: &[f32], weight: &[f32], bias: &
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn fast_exp_avx(x: __m256) -> __m256 {
-    let log2e = _mm256_set1_ps(1.442695041);
-    let ln2 = _mm256_set1_ps(0.6931471806);
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+    let ln2 = _mm256_set1_ps(std::f32::consts::LN_2);
 
     let val = _mm256_mul_ps(x, log2e);
     let val = _mm256_min_ps(val, _mm256_set1_ps(126.0));
@@ -718,7 +718,7 @@ pub unsafe fn int8_gemm_4rows_avx2(
 
         // 4 weight rows share the same xu (256-bit)
         acc0 = dot_i8_avx2_acc_256v2(acc0, xu,
-            _mm256_loadu_si256(w_int8.add(0 * in_dim + k) as *const __m256i), ones256);
+            _mm256_loadu_si256(w_int8.add(k) as *const __m256i), ones256);
         acc1 = dot_i8_avx2_acc_256v2(acc1, xu,
             _mm256_loadu_si256(w_int8.add(1 * in_dim + k) as *const __m256i), ones256);
         acc2 = dot_i8_avx2_acc_256v2(acc2, xu,
@@ -732,7 +732,7 @@ pub unsafe fn int8_gemm_4rows_avx2(
     if k + 16 <= in_dim {
         let xu = _mm_xor_si128(_mm_loadu_si128(x_int8.add(k) as *const __m128i), sf128);
         acc0 = dot_i8_avx2_acc_256(acc0, xu, _mm_setzero_si128(),
-            _mm_loadu_si128(w_int8.add(0 * in_dim + k) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(k) as *const __m128i),
             _mm_setzero_si128(), ones256);
         acc1 = dot_i8_avx2_acc_256(acc1, xu, _mm_setzero_si128(),
             _mm_loadu_si128(w_int8.add(1 * in_dim + k) as *const __m128i),
@@ -753,7 +753,7 @@ pub unsafe fn int8_gemm_4rows_avx2(
     let mut tail3 = 0i32;
     while k < in_dim {
         let xi = *x_int8.add(k) as i32;
-        tail0 += xi * (*w_int8.add(0 * in_dim + k) as i32);
+        tail0 += xi * (*w_int8.add(k) as i32);
         tail1 += xi * (*w_int8.add(1 * in_dim + k) as i32);
         tail2 += xi * (*w_int8.add(2 * in_dim + k) as i32);
         tail3 += xi * (*w_int8.add(3 * in_dim + k) as i32);
@@ -796,8 +796,8 @@ pub unsafe fn int8_gemm_4rows_vnni(
         let xu = _mm256_xor_si256(_mm256_set_m128i(x1, x0), sf);
 
         acc0 = dot_i8_vnni_acc(acc0, xu, _mm256_set_m128i(
-            _mm_loadu_si128(w_int8.add(0 * in_dim + k + 16) as *const __m128i),
-            _mm_loadu_si128(w_int8.add(0 * in_dim + k) as *const __m128i)));
+            _mm_loadu_si128(w_int8.add(k + 16) as *const __m128i),
+            _mm_loadu_si128(w_int8.add(k) as *const __m128i)));
         acc1 = dot_i8_vnni_acc(acc1, xu, _mm256_set_m128i(
             _mm_loadu_si128(w_int8.add(1 * in_dim + k + 16) as *const __m128i),
             _mm_loadu_si128(w_int8.add(1 * in_dim + k) as *const __m128i)));
@@ -817,7 +817,7 @@ pub unsafe fn int8_gemm_4rows_vnni(
     let mut tail3 = 0i32;
     while k < in_dim {
         let xi = *x_int8.add(k) as i32;
-        tail0 += xi * (*w_int8.add(0 * in_dim + k) as i32);
+        tail0 += xi * (*w_int8.add(k) as i32);
         tail1 += xi * (*w_int8.add(1 * in_dim + k) as i32);
         tail2 += xi * (*w_int8.add(2 * in_dim + k) as i32);
         tail3 += xi * (*w_int8.add(3 * in_dim + k) as i32);

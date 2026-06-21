@@ -29,7 +29,35 @@ On an Apple M5 Pro, qwen-asr transcribes a 28-second audio clip in **437 ms** �
 
 - [`docs/benchmarks/`](docs/benchmarks/) — benchmark methodology, latest results, and reproduction instructions
 - [`docs/optimizations/overview.md`](docs/optimizations/overview.md) — catalog of implemented performance optimizations
+- [`docs/optimizations/optimization-matrix-evaluation.md`](docs/optimizations/optimization-matrix-evaluation.md) — 8-combination A/B matrix on i5-10400
 - [`docs/research/`](docs/research/) — historical autoresearch experiment logs and protocols
+
+## GUI (Windows)
+
+A standalone Windows GUI binary is provided at `crates/qwen-asr-gui/`.
+It is built with eframe / egui and uses a `windows_subsystem = "windows"`
+release binary, so it launches without a console window. A top-level Win32
+SEH filter is installed first in `main()`; if the engine ever crashes
+(`EXCEPTION_ACCESS_VIOLATION` / `STACK_OVERFLOW` / `ILLEGAL_INSTRUCTION` /
+`INT_DIVIDE_BY_ZERO`), a `MessageBoxW` is shown and a detailed report is
+written to `<exe_dir>/logs/crash_<unix_secs>_<pid>.log`.
+
+### AVX-VNNI false-positive (Intel N95 / hybrid CPUs / VMs)
+
+Intel N95 / N100 / N305 (Alder Lake-N Gracemont) reports `avxvnni=1` in
+CPUID but the silicon lacks the `vpdpbusd` unit. Executing the AVX-VNNI
+INT8 path on it traps as `EXCEPTION_ILLEGAL_INSTRUCTION (0xC000001D)`.
+A microarchitecture allowlist in `crates/qwen-asr/src/kernels/mod.rs`
+already excludes Gracemont, but if you hit the crash on another hybrid
+Intel CPU or a Hyper-V VM, set the env var before launching:
+
+```powershell
+$env:QWEN_ASR_DISABLE_VNNI = "1"
+.\qwen-asr-gui.exe
+```
+
+`QWEN_ASR_ENABLE_VNNI=1` does the opposite (forces VNNI, bypasses the
+allowlist — use only if you know your CPU has the unit).
 
 ## Quick Start
 

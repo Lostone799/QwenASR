@@ -58,6 +58,66 @@ extern "C" {
     );
 }
 
+// OpenBLAS runtime thread control via dynamic loading (Windows DLL may not
+// export these in the import lib, so we LoadLibrary at runtime).
+#[cfg(all(feature = "blas", target_os = "windows"))]
+mod openblas_rt {
+    use std::sync::OnceLock;
+
+    type SetNumThreadsFn = unsafe extern "C" fn(i32);
+    type GetNumThreadsFn = unsafe extern "C" fn() -> i32;
+
+    struct OpenBlasRt {
+        set_threads: SetNumThreadsFn,
+        get_threads: GetNumThreadsFn,
+    }
+
+    static RT: OnceLock<Option<OpenBlasRt>> = OnceLock::new();
+
+    fn load() -> Option<&'static OpenBlasRt> {
+        RT.get_or_init(|| {
+            unsafe {
+                let lib = winapi_loadlibrary(b"libopenblas.dll\0");
+                if lib.is_null() { return None; }
+                let set_ptr = winapi_getprocaddress(lib, b"openblas_set_num_threads\0");
+                let get_ptr = winapi_getprocaddress(lib, b"openblas_get_num_threads\0");
+                if set_ptr.is_null() || get_ptr.is_null() { return None; }
+                Some(OpenBlasRt {
+                    set_threads: std::mem::transmute(set_ptr),
+                    get_threads: std::mem::transmute(get_ptr),
+                })
+            }
+        }).as_ref()
+    }
+
+    pub fn set_threads(n: i32) -> bool {
+        if let Some(rt) = load() {
+            unsafe { (rt.set_threads)(n); }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_threads() -> Option<i32> {
+        load().map(|rt| unsafe { (rt.get_threads)() })
+    }
+
+    unsafe fn winapi_loadlibrary(name: &[u8]) -> *mut std::ffi::c_void {
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut std::ffi::c_void;
+        }
+        LoadLibraryA(name.as_ptr())
+    }
+
+    unsafe fn winapi_getprocaddress(lib: *mut std::ffi::c_void, name: &[u8]) -> *mut std::ffi::c_void {
+        extern "system" {
+            fn GetProcAddress(lib: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+        }
+        GetProcAddress(lib, name.as_ptr())
+    }
+}
+
 #[cfg(feature = "blas")]
 const CBLAS_ROW_MAJOR: i32 = 101;
 #[cfg(feature = "blas")]
@@ -125,6 +185,21 @@ macro_rules! define_profile_counters {
                     }
                 )+
             }
+
+            pub fn report_string(&self) -> String {
+                let mut out = String::new();
+                $(
+                    let ns = self.$name.0.load(Ordering::Relaxed);
+                    let calls = self.$name.1.load(Ordering::Relaxed);
+                    if calls > 0 {
+                        let ms = ns as f64 / 1_000_000.0;
+                        let avg = ms / calls as f64;
+                        out.push_str(&format!("[profile] {}: {:.1}ms ({} calls, {:.2}ms avg)\n",
+                                  stringify!($name), ms, calls, avg));
+                    }
+                )+
+                out
+            }
         }
     }
 }
@@ -168,6 +243,9 @@ impl Drop for ProfileGuard {
 
 pub fn profile_reset() { PROF.reset(); }
 pub fn profile_report() { PROF.report(); }
+
+/// Get profile report as a string (for GUI/programmatic use)
+pub fn profile_report_string() -> String { PROF.report_string() }
 
 pub fn set_verbose(v: i32) {
     VERBOSE.store(v, Ordering::Relaxed);
@@ -253,7 +331,31 @@ fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
         };
         let n_threads = pool.n_threads_atomic.load(Ordering::Relaxed);
 
-        fn_call(fn_ptr, tid, n_threads);
+        // P1 fix: catch_unwind around the user closure. If a kernel panics on
+        // one worker (e.g. an OOB index in an AVX matvec), we still bump the
+        // done counter so the dispatch in parallel_for can complete, log the
+        // panic, and return — instead of killing the whole thread and leaving
+        // parallel_for() spinning forever waiting for n_threads-1 done signals.
+        //
+        // We don't try to abort the entire parallel section on first panic:
+        // the calling kernel code may have produced partial results that the
+        // caller needs to inspect. Just log and let the caller decide.
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fn_call(fn_ptr, tid, n_threads);
+        }));
+        if let Err(e) = call_result {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic in pool worker".to_string()
+            };
+            eprintln!(
+                "qwen-asr: worker thread {} panicked during parallel_for: {}",
+                tid, msg
+            );
+        }
         pool.done_atomic.fetch_add(1, Ordering::Release);
     }
 }
@@ -285,19 +387,58 @@ pub fn set_threads(n: usize) {
         let pool = get_pool();
         ensure_workers(pool, n);
     }
-    // Set OpenBLAS thread count via env var (DLL only exports cblas_sgemm).
-    // Benchmark: 8 OpenBLAS threads optimal with 12-pool (avoids
-    // oversubscription contention with bf16_matvec custom kernels).
+    // Set OpenBLAS thread count via runtime API (default: 4).
+    // Benchmark matrix shows BLAS 4 slightly outperforms BLAS 8 on 6C/12T
+    // due to reduced contention with custom INT8 matvec kernels.
+    // Use set_blas_threads() or --blas-threads CLI flag to override.
     #[cfg(all(feature = "blas", not(target_vendor = "apple")))]
     {
-        let blas_threads = (n * 2 / 3).max(1).min(8);
-        // SAFETY: single-threaded init path before any BLAS call
-        unsafe { std::env::set_var("OPENBLAS_NUM_THREADS", blas_threads.to_string()); }
+        let blas_threads = (n / 3).max(1).min(4);
+        set_blas_threads(blas_threads);
     }
     if verbose() >= 2 {
         eprintln!("Thread pool: {} threads", n);
     }
 }
+
+/// Set OpenBLAS thread count at runtime (takes effect immediately).
+/// Use this for dynamic tuning between encoding/decoding phases.
+#[cfg(all(feature = "blas", not(target_vendor = "apple")))]
+pub fn set_blas_threads(n: usize) {
+    let n = n.clamp(1, 64) as i32;
+    // Also set env var as fallback for any BLAS calls before runtime API
+    unsafe { std::env::set_var("OPENBLAS_NUM_THREADS", n.to_string()); }
+    // Try runtime API first (works after DLL is loaded)
+    #[cfg(target_os = "windows")]
+    {
+        openblas_rt::set_threads(n);
+    }
+    if verbose() >= 2 {
+        eprintln!("OpenBLAS threads: requested {}", n);
+    }
+}
+
+/// Get current OpenBLAS thread count.
+#[cfg(all(feature = "blas", not(target_vendor = "apple")))]
+pub fn get_blas_threads() -> usize {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(actual) = openblas_rt::get_threads() {
+            return actual as usize;
+        }
+    }
+    // Fallback: parse env var
+    std::env::var("OPENBLAS_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
+#[cfg(not(all(feature = "blas", not(target_vendor = "apple"))))]
+pub fn set_blas_threads(_n: usize) {}
+
+#[cfg(not(all(feature = "blas", not(target_vendor = "apple"))))]
+pub fn get_blas_threads() -> usize { 1 }
 
 pub fn get_num_threads() -> usize {
     THREAD_POOL_THREADS.load(Ordering::Relaxed)
@@ -433,6 +574,178 @@ type Int8ArgmaxFn = unsafe fn(*const i8, f32, *const i8, &[f32], &[i32], usize, 
 #[inline]
 fn select_int8_matvec_fn() -> Int8MatvecFn { neon::matvec_int8 }
 
+/// Returns true if AVX-VNNI should be used for the current process.
+///
+/// Defensive check: a small fraction of CPUs report `avxvnni=1` in CPUID
+/// (because the kernel reports the highest-common feature set across P/E
+/// cores on Intel hybrid CPUs, or because of a hypervisor hiding the
+/// real feature), but then fault with `EXCEPTION_ILLEGAL_INSTRUCTION`
+/// (`vpdpbusd` opcode 0xC4E2F9 0xFF) when the kernel is actually
+/// scheduled onto a core that lacks the unit.
+///
+/// The reported crash signature in the wild is:
+///
+///   EXCEPTION_ILLEGAL_INSTRUCTION (corrupted code or JIT failure) (0xC000001D)
+///   Faulting address: <inside a #[target_feature(enable = "avxvnni")] function>
+///
+/// which was previously fatal. Users can force the AVX2 path by setting
+/// `QWEN_ASR_DISABLE_VNNI=1` in the environment, which makes the engine
+/// fall back to the AVX2 PMADDUBSW implementation. The first call to any
+/// of the `select_*` helpers logs the chosen path to stderr so the
+/// decision is captured in any subsequent SEH crash report.
+fn vnni_allowed() -> bool {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static CACHE: AtomicI8 = AtomicI8::new(-1);
+    match CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            // -1 = uninitialised. Decide now and cache.
+            let env_off = std::env::var("QWEN_ASR_DISABLE_VNNI")
+                .ok()
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+                })
+                .unwrap_or(false);
+            let env_on = std::env::var("QWEN_ASR_ENABLE_VNNI")
+                .ok()
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+                })
+                .unwrap_or(false);
+            let cpu_id_ok = vnni_capable_cpu();
+            let cpuid_yes = is_x86_feature_detected!("avxvnni");
+            let allowed = if env_off {
+                false
+            } else if env_on {
+                true
+            } else {
+                // Both signals must agree: microarchitecture allowlist AND
+                // CPUID says yes. CPUID-yes on a non-allowlisted core is
+                // treated as a false positive (this is exactly the N95 case).
+                cpu_id_ok && cpuid_yes
+            };
+            CACHE.store(if allowed { 1 } else { 0 }, Ordering::Relaxed);
+            eprintln!(
+                "qwen-asr: INT8 kernel selection: AVX2={}, AVX-VNNI={} (cpuid_yes={}, allowlist_ok={}, QWEN_ASR_DISABLE_VNNI={}, QWEN_ASR_ENABLE_VNNI={})",
+                is_x86_feature_detected!("avx2"),
+                allowed,
+                cpuid_yes,
+                cpu_id_ok,
+                env_off,
+                env_on
+            );
+            allowed
+        }
+    }
+}
+
+/// Reads CPUID leaf 0/1 and decides whether the silicon actually has
+/// the AVX-VNNI `vpdpbusd` unit.
+///
+/// Conservative allowlist (only microarchitectures verified to have
+/// the unit are accepted). Other CPUs return `false` unless
+/// `QWEN_ASR_ENABLE_VNNI=1` is set, in which case this check is
+/// bypassed.
+///
+/// **Intentionally excluded**: Intel N95/N100/N305 (Gracemont, family
+/// 6 model 0x9A) — that microarchitecture reports `avxvnni=1` in
+/// CPUID but does NOT have the `vpdpbusd` unit, so any execution
+/// traps as `EXCEPTION_ILLEGAL_INSTRUCTION` (0xC000001D).
+#[cfg(target_arch = "x86_64")]
+fn vnni_capable_cpu() -> bool {
+    // Run CPUID via raw asm. Stable Rust doesn't expose __get_cpuid, but
+    // the encoding is trivial: eax = leaf, cpuid, results in eax/ebx/ecx/edx.
+    // Safety: CPUID is documented as a non-faulting, non-side-effecting
+    // instruction; running it with eax=0 and eax=1 only writes to
+    // general-purpose registers and is safe in any context.
+    #[inline(always)]
+    unsafe fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+        let eax: u32;
+        let ebx_out: u32;
+        let ecx: u32;
+        let edx: u32;
+        // ebx is reserved by LLVM (it's the base pointer). Workaround: stash
+        // it into a normal `out(reg)` slot using `inlateout` and explicitly
+        // mention that slot in the asm string with `mov` to copy ebx to it.
+        core::arch::asm!(
+            "mov eax, {leaf:e}",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            leaf = in(reg) leaf,
+            ebx_out = lateout(reg) ebx_out,
+            lateout("eax") eax,
+            lateout("ecx") ecx,
+            lateout("edx") edx,
+            options(nostack, preserves_flags),
+        );
+        (eax, ebx_out, ecx, edx)
+    }
+
+    let v0 = unsafe { cpuid(0) };
+    let mut vendor_bytes = [0u8; 12];
+    vendor_bytes[0..4].copy_from_slice(&v0.1.to_le_bytes()); // EBX
+    vendor_bytes[4..8].copy_from_slice(&v0.3.to_le_bytes()); // EDX
+    vendor_bytes[8..12].copy_from_slice(&v0.2.to_le_bytes()); // ECX
+    let vendor_str = std::str::from_utf8(&vendor_bytes).unwrap_or("");
+
+    let v1 = unsafe { cpuid(1) };
+    let eax = v1.0;
+    let family_id = (eax >> 8) & 0x0F;
+    let model_id = (eax >> 4) & 0x0F;
+    let ext_family = (eax >> 20) & 0xFF;
+    let ext_model = (eax >> 16) & 0x0F;
+    let display_family = if family_id == 0x0F {
+        ext_family + family_id
+    } else {
+        family_id
+    };
+    let display_model = if family_id == 0x06 || family_id == 0x0F {
+        (ext_model << 4) | model_id
+    } else {
+        model_id
+    };
+
+    let mut ok = false;
+    if vendor_str == "GenuineIntel" && display_family == 6 {
+        // Intel Core / Atom microarchitectures with verified VNNI.
+        // Note: 0x9A (Gracemont / Alder Lake-N) is INTENTIONALLY
+        // excluded — see doc comment above.
+        match display_model {
+            0x97   // Alder Lake P
+            | 0x9E // Alder Lake S / Raptor Lake S
+            | 0xA7 // Raptor Lake P
+            | 0x8C // Meteor Lake P
+            | 0xAA // Lunar Lake
+            | 0x8F // Sapphire Rapids
+            | 0xAD // Sierra Forest / Grand Ridge
+            | 0xB7 // Granite Rapids
+            | 0xCF // Emerald Rapids
+            | 0xB5 // Arrow Lake
+            => ok = true,
+            _ => ok = false,
+        }
+    } else if vendor_str == "AuthenticAMD" && display_family == 25 {
+        // AMD Zen 4 (family 25h) and later have VNNI. Models 0x10+.
+        if display_model >= 0x10 {
+            ok = true;
+        }
+    }
+
+    eprintln!(
+        "qwen-asr: CPUID vendor='{}' family={} model={} (display_family={} display_model=0x{:02X})",
+        vendor_str, family_id, model_id, display_family, display_model
+    );
+    ok
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn vnni_capable_cpu() -> bool {
+    false
+}
+
 /// Select the best INT8 matvec kernel for the current CPU (AVX2 or AVX-VNNI).
 /// Returns `None` if no AVX2 support (caller must fall back to f32 path).
 #[cfg(not(target_arch = "aarch64"))]
@@ -441,7 +754,7 @@ fn select_int8_matvec_fn() -> Option<Int8MatvecFn> {
     if !is_x86_feature_detected!("avx2") {
         return None;
     }
-    Some(if is_x86_feature_detected!("avxvnni") {
+    Some(if vnni_allowed() {
         avx::matvec_int8_vnni
     } else {
         avx::matvec_int8_avx2
@@ -461,7 +774,7 @@ fn select_int8_argmax_fn() -> Option<Int8ArgmaxFn> {
     if !is_x86_feature_detected!("avx2") {
         return None;
     }
-    Some(if is_x86_feature_detected!("avxvnni") {
+    Some(if vnni_allowed() {
         avx::argmax_int8_range_vnni
     } else {
         avx::argmax_int8_range_avx2
@@ -1019,7 +1332,7 @@ fn select_int8_gemm_4rows_fn() -> Int8Gemm4RowsFn {
     if !is_x86_feature_detected!("avx2") {
         // Fallback: use 4x scalar rows (delegates to int8_fallback_matvec per row)
         int8_gemm_4rows_fallback
-    } else if is_x86_feature_detected!("avxvnni") {
+    } else if vnni_allowed() {
         avx::int8_gemm_4rows_vnni
     } else {
         avx::int8_gemm_4rows_avx2
@@ -1034,7 +1347,7 @@ unsafe fn int8_gemm_4rows_fallback(
     x_scale: f32,
     w_int8: *const i8,
     w_scales: *const f32,
-    w_sums: *const i32,
+    _w_sums: *const i32,
     in_dim: usize,
 ) {
     for r in 0..4 {
@@ -2421,7 +2734,10 @@ pub fn quantize_f32_to_int8_into(x: &[f32], buf: &mut Vec<i8>) -> f32 {
 }
 
 /// Quantize BF16 weights to INT8 per-row. Returns (int8_data, per_row_scales, per_row_w_sums).
-pub fn quantize_bf16_weights_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
+///
+/// # Safety
+/// `w_bf16` must point to a valid buffer of `out_dim * in_dim` u16 elements.
+pub unsafe fn quantize_bf16_weights_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
     #[cfg(target_arch = "aarch64")]
     unsafe { return neon::quantize_bf16_to_int8(w_bf16, out_dim, in_dim); }
     #[cfg(not(target_arch = "aarch64"))]
