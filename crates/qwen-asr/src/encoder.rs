@@ -413,10 +413,12 @@ impl Encoder {
             }
 
             // Conv2D layer 1: [1, 128, chunk_w] -> [480, h1, w1]
+            // Fused with GELU activation (P0 v0.3) — saves one full
+            // sweep over c1 (~150 KB) plus the parallel_for dispatch.
             let h1 = (128 + 2 - 3) / 2 + 1; // 64
             let w1 = (chunk_w + 2 - 3) / 2 + 1;
             let c1 = &mut bufs.c1[..CONV_HIDDEN * h1 * w1];
-            kernels::conv2d_with_cols(
+            kernels::conv2d_with_cols_gelu(
                 c1,
                 chunk_mel,
                 &self.conv1_weight,
@@ -431,13 +433,13 @@ impl Encoder {
                 2,
                 1,
             );
-            kernels::gelu(c1, CONV_HIDDEN * h1 * w1);
 
             // Conv2D layer 2: [480, h1, w1] -> [480, h2, w2]
+            // Fused with GELU activation (P0 v0.3).
             let h2 = (h1 + 2 - 3) / 2 + 1; // 32
             let w2 = (w1 + 2 - 3) / 2 + 1;
             let c2 = &mut bufs.c2[..CONV_HIDDEN * h2 * w2];
-            kernels::conv2d_with_cols(
+            kernels::conv2d_with_cols_gelu(
                 c2,
                 c1,
                 &self.conv2_weight,
@@ -452,14 +454,14 @@ impl Encoder {
                 2,
                 1,
             );
-            kernels::gelu(c2, CONV_HIDDEN * h2 * w2);
 
             // Conv2D layer 3: [480, h2, w2] -> [480, h3, w3]
+            // Fused with GELU activation (P0 v0.3).
             let h3 = (h2 + 2 - 3) / 2 + 1; // 16
             let _w3_calc = (w2 + 2 - 3) / 2 + 1;
             debug_assert_eq!(_w3_calc, w3);
             let c3 = &mut bufs.c3[..CONV_HIDDEN * h3 * w3];
-            kernels::conv2d_with_cols(
+            kernels::conv2d_with_cols_gelu(
                 c3,
                 c2,
                 &self.conv3_weight,
@@ -474,7 +476,6 @@ impl Encoder {
                 2,
                 1,
             );
-            kernels::gelu(c3, CONV_HIDDEN * h3 * w3);
 
             // Reshape [480, h3, w3] -> [w3, 480*h3]
             // Loop order: ch → f → t for sequential reads from c3

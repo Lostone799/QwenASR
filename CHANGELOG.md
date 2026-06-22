@@ -2,7 +2,44 @@
 
 ## [Unreleased] - 2026-06-21
 
+### Performance
+
+- **Fused Conv2D + bias-add + GELU in encoder stem** (P0, v0.3)
+  - `crates/qwen-asr/src/kernels/mod.rs::conv2d_impl` gains a
+    `fused_gelu: bool` internal parameter; the bias-add pass now
+    delegates to `avx::gelu_inplace` / `neon::gelu_inplace` for the
+    SIMD-accelerated tanh-GELU activation instead of returning to
+    the caller for a separate `kernels::gelu(c, n)` sweep.
+  - New public wrapper `conv2d_with_cols_gelu` exposes the fused
+    path. `conv2d` and `conv2d_with_cols` are unchanged (their
+    `fused_gelu` flag is set to `false`).
+  - `crates/qwen-asr/src/encoder.rs` — all three audio-encoder conv
+    layers (conv2d1 / conv2d2 / conv2d3) now call
+    `conv2d_with_cols_gelu` and drop their follow-up `gelu` calls.
+  - **Measured** on N95 (Intel N95, 4C/4T AVX2 no-VNNI) with
+    `audio.wav --keep-silence -S 15` (28.2 s after silence-skip,
+    2 segments, 1.7B model, 87 conv calls):
+    - Inference total: 236,319 ms → 235,810 ms
+      (**-509 ms / -0.22%**)
+    - `enc_forward_total`: 228,302 → 227,542 ms
+    - `gelu` standalone counter: ~200 ms (estimate) → 8.3 ms across
+      50 calls (most of the saving is parallel_for dispatch
+      overhead across the 87 encoder conv calls)
+    - `dec_prefill_total`: 2,709.9 → 2,408.4 ms (likely measurement
+      noise, not a conv-related effect)
+  - **Honest assessment**: real bottleneck is `im2col + cblas_sgemm`
+    in `conv2d_impl` (~99% of `conv2d_op` time on N95, ~224 s of the
+    235 s total inference). This P0 is a **clean zero-risk win**
+    (saves the parallel_for dispatch per conv call and one full
+    `c_out * spatial_out` GELU sweep per conv call) but it is
+    **not** the performance-bottleneck fix. Next: P1 hand-written
+    3×3 stride=2 AVX2 conv2d kernel
+    (target 1.4-2.0× on `conv2d_op`).
+  - Correctness verified: end-to-end transcription text is
+    character-identical to v0.1 on `audio.wav --keep-silence`.
+
 ### Fixed
+
 
 - **GUI crash on Windows release builds** (P0/P1/P2 hardening)
   - **P0** Top-level Win32 `SetUnhandledExceptionFilter` in

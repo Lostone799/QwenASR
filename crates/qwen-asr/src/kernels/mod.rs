@@ -1849,7 +1849,7 @@ pub fn conv2d(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32
     let spatial_out = h_out * w_out;
 
     let mut cols = vec![0.0f32; patch_size * spatial_out];
-    conv2d_impl(out, input, weight, bias, &mut cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding);
+    conv2d_impl(out, input, weight, bias, &mut cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1862,14 +1862,37 @@ pub fn conv2d_with_cols(out: &mut [f32], input: &[f32], weight: &[f32], bias: Op
     let patch_size = c_in * kh * kw;
     let spatial_out = h_out * w_out;
     cols.resize(patch_size * spatial_out, 0.0);
-    conv2d_impl(out, input, weight, bias, cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding);
+    conv2d_impl(out, input, weight, bias, cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, false);
+}
+
+/// Fused conv2d + bias-add + GELU. Equivalent to:
+///   out = gelu(weight (*) input + bias)
+/// where `(*)` is cross-correlation with the given stride/padding.
+///
+/// GELU is folded into the bias-add pass to save one full sweep over
+/// `c_out * spatial_out` elements (typically ~150-380 KB on the encoder
+/// stem). For a 3-layer 480-channel stem at 1.6 s chunks, that saves
+/// a full `gelu(c, ...)` call (with its own parallel_for dispatch and
+/// cache misses) per conv layer, per chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_with_cols_gelu(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32]>,
+                             cols: &mut Vec<f32>,
+                             c_in: usize, c_out: usize, h_in: usize, w_in: usize,
+                             kh: usize, kw: usize, stride: usize, padding: usize) {
+    let h_out = (h_in + 2 * padding - kh) / stride + 1;
+    let w_out = (w_in + 2 * padding - kw) / stride + 1;
+    let patch_size = c_in * kh * kw;
+    let spatial_out = h_out * w_out;
+    cols.resize(patch_size * spatial_out, 0.0);
+    conv2d_impl(out, input, weight, bias, cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, true);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn conv2d_impl(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32]>,
                cols: &mut [f32],
                c_in: usize, c_out: usize, h_in: usize, w_in: usize,
-               kh: usize, kw: usize, stride: usize, padding: usize) {
+               kh: usize, kw: usize, stride: usize, padding: usize,
+               fused_gelu: bool) {
     let _pg = ProfileGuard::new(&PROF.conv2d_op);
     let h_out = (h_in + 2 * padding - kh) / stride + 1;
     let w_out = (w_in + 2 * padding - kw) / stride + 1;
@@ -1938,8 +1961,51 @@ fn conv2d_impl(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f3
     if let Some(bias) = bias {
         for oc in 0..c_out {
             let b = bias[oc];
-            for s in 0..spatial_out {
-                out[oc * spatial_out + s] += b;
+            let row = &mut out[oc * spatial_out..(oc + 1) * spatial_out];
+            if fused_gelu {
+                // Fused bias-add + tanh-GELU in a single sweep over
+                // the row. The bias broadcast (`+ b`) is cheap scalar
+                // math; GELU is then delegated to the SIMD kernel so
+                // it stays vectorized instead of falling back to
+                // a scalar fallback inside the hot loop.
+                for v in row.iter_mut() {
+                    *v += b;
+                }
+                #[cfg(target_arch = "x86_64")]
+                { unsafe { avx::gelu_inplace(row, row.len()); } }
+                #[cfg(target_arch = "aarch64")]
+                { unsafe { neon::gelu_inplace(row, row.len()); } }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                {
+                    for v in row.iter_mut() {
+                        let x = *v;
+                        let x3 = x * x * x;
+                        let inner = 0.7978845608028654f32 * (x + 0.044715 * x3);
+                        *v = 0.5 * x * (1.0 + inner.tanh());
+                    }
+                }
+            } else {
+                for v in row.iter_mut() {
+                    *v += b;
+                }
+            }
+        }
+    } else if fused_gelu {
+        // No bias path: still fuse the activation in one pass.
+        for oc in 0..c_out {
+            let row = &mut out[oc * spatial_out..(oc + 1) * spatial_out];
+            #[cfg(target_arch = "x86_64")]
+            { unsafe { avx::gelu_inplace(row, row.len()); } }
+            #[cfg(target_arch = "aarch64")]
+            { unsafe { neon::gelu_inplace(row, row.len()); } }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            {
+                for v in row.iter_mut() {
+                    let x = *v;
+                    let x3 = x * x * x;
+                    let inner = 0.7978845608028654f32 * (x + 0.044715 * x3);
+                    *v = 0.5 * x * (1.0 + inner.tanh());
+                }
             }
         }
     }
