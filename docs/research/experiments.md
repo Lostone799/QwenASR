@@ -8,6 +8,8 @@ This file collects the optimization experiment diaries.
 - [Speed Improvement Experiments — Round 2](#speed-improvement-experiments-round-2)
 - [WER Recovery Experiments](#wer-recovery-experiments)
 - [Perf-round2 vs. Previous Implementation](#perf-round2-vs-previous-implementation)
+- [Speed Improvement Experiments — Round 3](#speed-improvement-experiments--round-3)
+- [Fable Ideas Experiments](#fable-ideas-experiments)
 
 ## Speed Improvement Experiments — Round 1
 
@@ -2208,3 +2210,1204 @@ The 100-file LibriSpeech offline WER gate is unchanged:
 Decision: **Validated after merge.** The merged `main` is faster than the
 previous `main` on all three benchmark modes with no WER regression. The
 temporary `ggml-idea.md` queue file was removed after all ideas were checked.
+
+## Fable Ideas Experiments
+
+Goal: try unchecked ideas from `fable-ideas.md` one by one. Keep code only if
+the speed benchmark improves while the 100-file LibriSpeech WER gate remains
+acceptable.
+
+Baseline for F1 (`e34ba23`, detached worktree, `bench/run.sh --runs 10`):
+
+| Mode | Inference |
+|------|----------:|
+| offline | 479.0 ms |
+| segmented | 344.5 ms |
+| streaming | 366.5 ms |
+| overall average | 396.7 ms |
+
+### F1: prompt-prefix KV reuse
+
+Change:
+- Split decoder prefill so the fixed prompt prefix (`PREFIX_HEAD`, optional
+  prompt tokens, `PREFIX_TAIL`) is prefetched once.
+- Saved the prefix KV cache in a compact snapshot and restored it for later
+  segments before pre-filling audio-dependent rows.
+
+Results:
+- Speed (`bench/run.sh --runs 10`):
+
+| Mode | Baseline | F1 | Delta |
+|------|---------:|---:|------:|
+| offline | 479.0 ms | 541.0 ms | +12.9% |
+| segmented | 344.5 ms | 407.5 ms | +18.3% |
+| streaming | 366.5 ms | 364.5 ms | -0.5% |
+| overall average | 396.7 ms | 437.7 ms | +10.3% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F1 |
+|--------|---:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0430 |
+| Corpus CER | 0.0169 |
+
+Decision: **Rejected.** WER stayed under the `0.04` corpus gate, but the speed
+benchmark regressed overall and in the offline/segmented modes where this idea
+was expected to help. The likely overhead is the extra `decoder_prefill` call
+and snapshot/restore copies being larger than the small fixed-prefix GEMM saved
+on the current benchmark. Code was reverted; only this result is retained.
+
+### F22: parallel page-touch prefault probe
+
+Change:
+- Kept the existing `MADV_WILLNEED` hint for each safetensors mmap.
+- Added an explicit scoped-thread page-touch pass over the mapped file, reading
+  one byte per OS page with `read_volatile` so page faults happen before tensor
+  parsing and weight conversion loops.
+
+Results:
+- Speed (`bench/run.sh --runs 10`):
+
+| Mode | Baseline | F22 | Delta |
+|------|---------:|----:|------:|
+| offline | 479.0 ms | 462.5 ms | -3.4% |
+| segmented | 344.5 ms | 343.5 ms | -0.3% |
+| streaming | 366.5 ms | 362.0 ms | -1.2% |
+| overall average | 396.7 ms | 389.3 ms | -1.9% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F22 |
+|--------|----:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Accepted.** The speed benchmark improved overall, with the largest
+gain in offline mode, and WER stayed under the `0.04` corpus gate. Keep the
+parallel prefault code.
+
+### F23: profile-guided optimization
+
+Change:
+- Built an instrumented release binary with
+  `RUSTFLAGS='-Cprofile-generate=/tmp/q-asr-pgo-data'`.
+- Trained it with one full `bench/run.sh` pass over offline, segmented, and
+  streaming modes.
+- Merged 22 `.profraw` files with Homebrew `llvm-profdata` 21.1.8 and built a
+  `profile-use` release binary from the merged profile.
+
+Results:
+- Speed (`bench/run.sh --runs 10`, compared against the accepted F22 build):
+
+| Mode | F22 | F23 PGO | Delta |
+|------|----:|--------:|------:|
+| offline | 462.5 ms | 469.0 ms | +1.4% |
+| segmented | 343.5 ms | 347.5 ms | +1.2% |
+| streaming | 362.0 ms | 377.0 ms | +4.1% |
+| overall average | 389.3 ms | 397.8 ms | +2.2% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F23 PGO |
+|--------|--------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected/deferred.** WER stayed under the `0.04` corpus gate, but
+the trained PGO binary regressed speed versus the accepted F22 build. The
+`profile-use` build also emitted many missing-profile warnings, so a broader
+training corpus might be worth revisiting later, but this local PGO artifact is
+not kept and no build-flow change was committed.
+
+### F13: BNNS bf16 GEMM microbenchmark
+
+Change:
+- Wrote a temporary C probe outside the repo to compare the proposed BNNS bf16
+  matmul path against the current prefill path shape: bf16 weight conversion to
+  f32 followed by Accelerate `cblas_sgemm`.
+- Tested representative decoder-prefill matrix shapes:
+  `M=128,K=1024,N=1024`, `M=128,K=1024,N=2816`,
+  `M=256,K=1024,N=1024`, and `M=256,K=1024,N=2816`.
+
+Probe result:
+- `BNNSMatMulWorkspaceSize(false, true, ..., inputB=BNNSDataTypeBFloat16, ...)`
+  returned `-1` for all tested shapes.
+- `BNNSMatMul` warmup returned `rc=-1` for all tested shapes.
+- The direct `BNNSMatMul` API is therefore not a viable low-risk replacement
+  for the current bf16-to-f32 scratch plus SGEMM path on this system.
+
+Results:
+- Speed (`bench/run.sh --runs 10`, current F22 code, no BNNS integration):
+
+| Mode | F22 | F13 probe build | Delta |
+|------|----:|----------------:|------:|
+| offline | 462.5 ms | 473.0 ms | +2.3% |
+| segmented | 343.5 ms | 349.5 ms | +1.7% |
+| streaming | 362.0 ms | 366.5 ms | +1.2% |
+| overall average | 389.3 ms | 396.3 ms | +1.8% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F13 probe build |
+|--------|----------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected/deferred.** The re-entry condition from G37 was not met:
+the direct BNNS bf16 matmul probe could not run for the real prefill shapes.
+No code change was made. A future revisit would need BNNSGraph or another
+Apple bf16 API, not the deprecated direct `BNNSMatMul` entry point.
+
+### F19/F20: mmap-backed prequantized weight cache / shipped artifacts
+
+Change:
+- Audited the current decoder INT8 ownership model before implementing a
+  sidecar cache.
+- The hot decode weights are stored directly as owned `Vec<i8>` plus owned
+  `Vec<f32>` scales on every `DecLayer`, with separate fields for Q/K/V/O,
+  fused gate-up, down, and `lm_head`.
+- Current decode kernels consume ordinary slices from those `Vec`s. A true F19
+  implementation needs a `WeightSlice`/owner abstraction that can represent
+  either owned superpage `Vec` data or a range inside a kept-alive mmap sidecar.
+
+Results:
+- No code change was made. A smaller cache that reads the sidecar back into
+  owned `Vec`s would repeat the A1 failure mode instead of testing F19.
+- Current accepted-code benchmark evidence remains the F22 run:
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 462.5 ms |
+| segmented | 343.5 ms |
+| streaming | 362.0 ms |
+| overall average | 389.3 ms |
+
+- Current accepted-code 100-file LibriSpeech offline WER remains:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected/deferred for this pass.** F19/F20 are valid architecture
+work, but the minimal honest implementation is a cross-cutting weight-storage
+refactor plus sidecar metadata/versioning. No partial owned-Vec cache was kept,
+because it would not test the zero-copy mmap-backed idea. Revisit when doing
+the F27 shared-weights/session split or a dedicated artifact-format change.
+
+### F25: dispatch accounting for `parallel_for`
+
+Change:
+- Temporarily added profile-only counters around `parallel_for` to measure
+  dispatch wall time and call count.
+- Temporarily extended `bench/parse_stderr.sh` and `bench/run.sh` to preserve
+  profile call counts and average latency in JSON.
+
+Measurement:
+- Profile run (`bench/run.sh --runs 3 --profile`):
+
+| Mode | Dispatch calls | Dispatch time | Avg dispatch |
+|------|---------------:|--------------:|-------------:|
+| offline | 1175 | 105.7 ms | 0.09 ms |
+| segmented | 1145 | 71.9 ms | 0.06 ms |
+| streaming | 1182 | 81.8 ms | 0.07 ms |
+
+Results:
+- Speed (`bench/run.sh --runs 10`, with temporary accounting code, no profile):
+
+| Mode | F22 | F25 accounting | Delta |
+|------|----:|---------------:|------:|
+| offline | 462.5 ms | 470.0 ms | +1.6% |
+| segmented | 343.5 ms | 357.5 ms | +4.1% |
+| streaming | 362.0 ms | 374.0 ms | +3.3% |
+| overall average | 389.3 ms | 400.5 ms | +2.9% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F25 accounting |
+|--------|---------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected as a code change, useful as data.** WER stayed under the
+gate, and the profile data confirms that dispatch overhead is measurable, but
+the accounting patch itself regressed normal benchmark speed and is not an
+optimization. Code was reverted. F9 remains worth a targeted barrier-fusion
+probe because the measured dispatch ceiling is tens of milliseconds.
+
+### F9: fuse per-token thread-pool dispatches
+
+Change:
+- Audited the call sites behind the F25 dispatch counts.
+- The largest contributors are not adjacent norm/QKV regions as originally
+  hypothesized: `rms_norm` is row-local and does not call `parallel_for` for
+  single-token decode. The `parallel_for` calls are inside INT8 matvec/QKV,
+  SwiGLU, down projection, attention, and argmax.
+- Those stages have real data dependencies (`x_norm` before QKV, attention
+  before O-proj, SwiGLU output before down projection, final norm before
+  argmax). A safe fusion would require writing new fused kernels or a persistent
+  staged worker loop, not just moving existing call boundaries.
+
+Results:
+- No code change was made for F9. The measured F25 data is the relevant
+  benchmark evidence:
+
+| Mode | Dispatch calls | Dispatch time | Avg dispatch |
+|------|---------------:|--------------:|-------------:|
+| offline | 1175 | 105.7 ms | 0.09 ms |
+| segmented | 1145 | 71.9 ms | 0.06 ms |
+| streaming | 1182 | 81.8 ms | 0.07 ms |
+
+Decision: **Deferred.** The measured ceiling is real, but there is no low-risk
+adjacent-region fusion in the current code shape. Revisit as a dedicated
+persistent per-token staged worker experiment; do not land a superficial
+barrier-fusion patch.
+
+### F4: exact bound-pruned lm_head argmax
+
+Change:
+- Implemented a chunk-level exact Cauchy-Schwarz bound probe for the INT8
+  `lm_head` argmax.
+- At load time, computed each lm_head chunk's maximum effective row norm
+  (`||int8_row * row_scale||`) and sorted chunks by descending bound.
+- At decode time, computed the quantized input norm, scanned chunks in bound
+  order using the existing contiguous NEON `argmax_int8_range`, and skipped
+  remaining chunks only when `chunk_bound * ||x|| < best_score`.
+
+Results:
+- Speed (`bench/run.sh --runs 10`):
+
+| Mode | F22 | F4 | Delta |
+|------|----:|---:|------:|
+| offline | 462.5 ms | 476.0 ms | +2.9% |
+| segmented | 343.5 ms | 355.0 ms | +3.3% |
+| streaming | 362.0 ms | 369.5 ms | +2.1% |
+| overall average | 389.3 ms | 400.2 ms | +2.8% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F4 |
+|--------|---:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected.** WER stayed under the gate, but the speed benchmark
+regressed in all modes. The chunk bounds were not tight enough to offset the
+extra norm/order metadata and non-linear chunk scan. Code was reverted.
+
+### F5: lockstep batched decode across segments
+
+Change:
+- Audited the segmented transcription and decoder APIs.
+- `transcribe_segmented` processes segments serially with one mutable
+  `QwenCtx`, and each segment calls the single-session `transcribe_segment`.
+- `decoder_forward` advances exactly one `KvCache` and one set of
+  `DecoderBuffers` for one token; there is no `[B, dim]` skinny-GEMM decode
+  path or per-segment batch of KV caches.
+- Implementing F5 correctly requires independent per-segment sessions sharing
+  immutable weights, which is the same F27 prerequisite identified for F16/F28.
+
+Results:
+- No code change was made. A local attempt without F27 would either duplicate
+  model weights per segment or introduce unsafe shared mutable state.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F5 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 603 ms |
+| segmented | 448 ms |
+| streaming | 467 ms |
+| overall average | 506.0 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred, blocked by F27.** Lockstep batched decode is still a
+high-ceiling long-audio idea, but it first needs shared immutable weights plus
+multiple session states and new batched INT8 decode kernels. No code was kept.
+
+### F6: self-speculative streaming decode
+
+Change:
+- Audited the streaming decode implementations.
+- `transcribe_stream` and `stream_push_audio` already reuse encoder windows and
+  decoder prefill rows via `prefill_lcp_len`, so repeated audio prefixes avoid
+  some prefill work.
+- The autoregressive tail is still verified one token at a time with
+  `decoder_forward`; there is no draft-token verification path that runs a
+  previous chunk's token suffix through a batched multi-token forward and
+  accepts the longest matching greedy prefix.
+- The only multi-token logits path remains `decoder_prefill_logits`, which
+  materializes full vocabulary logits and is not an efficient verifier.
+
+Results:
+- No code change was made. A correct F6 implementation needs a batched
+  verification kernel/API that can test proposed tokens without full-logit
+  materialization.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F6 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 468 ms |
+| segmented | 349 ms |
+| streaming | 366 ms |
+| overall average | 394.3 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** The existing streaming code covers prefix/prefill
+reuse, but not self-speculative decode verification. Revisit together with the
+F7 batched greedy-verifier work so both ideas can use the same efficient
+multi-token argmax path. No code was kept.
+
+### F7: Jacobi / lookahead parallel decoding
+
+Change:
+- Audited the decoder APIs needed for an exact Jacobi/lookahead probe.
+- Current single-token decode returns only one greedy token via
+  `decoder_forward`.
+- The only multi-token API that exposes logits is `decoder_prefill_logits`,
+  which materializes full `[seq_len x vocab]` logits through BF16
+  `linear_nobias_bf16_scratch`; it was written for forced aligner logits, not
+  efficient ASR decode verification.
+
+Results:
+- No code change was made. A direct prototype using `decoder_prefill_logits`
+  would perform K full-vocabulary projections for every Jacobi iteration and
+  would measure missing infrastructure rather than the intended algorithm.
+- Current accepted-code benchmark evidence remains the F22 run:
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 462.5 ms |
+| segmented | 343.5 ms |
+| streaming | 362.0 ms |
+| overall average | 389.3 ms |
+
+- Current accepted-code 100-file LibriSpeech offline WER remains:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** The Jacobi idea remains plausible, but this codebase
+first needs a batched multi-position greedy-argmax path that avoids
+materializing full logits. Without that kernel, a Jacobi prototype is expected
+to regress and would not test the intended bandwidth-to-AMX trade.
+
+### F27: shared-weight / per-session state split
+
+Change:
+- Audited `QwenCtx` ownership and call sites.
+- `QwenCtx` currently owns both immutable model state (`Encoder`, `Decoder`,
+  safetensors mmap, tokenizer-related model path) and mutable runtime/session
+  state (`KvCache`, decoder buffers, encoder buffers, RoPE cache, streaming
+  callback/settings, prompt caches, perf counters).
+- Public and embedding surfaces directly store or mutate `QwenCtx`: CLI, C API,
+  Flutter bridge, streaming push API, forced aligner, and regression tests.
+
+Results:
+- No code change was made. A correct F27 implementation is a cross-cutting API
+  refactor, not a local optimization patch.
+- Current accepted-code benchmark evidence remains the F22 run:
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 462.5 ms |
+| segmented | 343.5 ms |
+| streaming | 362.0 ms |
+| overall average | 389.3 ms |
+
+- Current accepted-code 100-file LibriSpeech offline WER remains:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F27 is a real prerequisite for F5/F16/F28/F29, but it
+needs a planned API migration to `Arc<ModelWeights>` plus `Session` across CLI,
+C API, Flutter, aligner, and tests. No partial split was kept.
+
+### F16: segment-level pipelining
+
+Change:
+- Audited the segmented transcription loop and runtime state ownership.
+- `transcribe_segmented` calls `transcribe_segment(ctx, ...)` serially with one
+  mutable `QwenCtx`.
+- Encoder scratch (`ctx.enc_bufs`), decoder scratch (`ctx.dec_bufs`), KV cache,
+  RoPE cache, perf counters, and prompt state all live in the same context.
+
+Results:
+- No code change was made. A correct encode-N+1/decode-N pipeline needs at
+  least two independent session states sharing immutable weights. That is the
+  F27 split.
+- Current accepted-code benchmark evidence remains the F22 run:
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 462.5 ms |
+| segmented | 343.5 ms |
+| streaming | 362.0 ms |
+| overall average | 389.3 ms |
+
+- Current accepted-code 100-file LibriSpeech offline WER remains:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred, blocked by F27.** Segment pipelining is still a good
+long-audio optimization, but implementing it before shared weights/session
+state would duplicate weights or introduce unsafe shared mutable buffers. No
+code change was made.
+
+### F3/F2: mixed-precision FFN INT4 and full group-wise INT4 decoder weights
+
+Change:
+- Audited the current decode weight and kernel path before attempting an INT4
+  patch.
+- Decode weights are loaded from BF16 and quantized once into owned per-row
+  INT8 buffers (`wq/wk/wv/wo`, fused `gate_up`, `down`, and `lm_head`).
+- The hot FFN path calls `linear_nobias_int8_swiglu` and
+  `linear_nobias_int8_addto`, which both expect contiguous INT8 rows plus
+  per-row f32 scales and delegate to the NEON INT8 SDOT matvec kernel.
+- A real F3/F2 experiment needs a new group-wise INT4 packed format,
+  zero-points/scales, activation-aware calibration, and a fused
+  dequantize-inside-matvec NEON kernel. Packing to INT4 and expanding back to
+  INT8 at load or before matvec would not reduce decode bandwidth and would not
+  test the intended optimization.
+
+Results:
+- No code change was made. Current accepted-code benchmark evidence for this
+  audit run:
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 478 ms |
+| segmented | 352 ms |
+| streaming | 372 ms |
+| overall average | 400.7 ms |
+
+- Current accepted-code 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F3 is still the right stepping stone for F2, but it is
+not a local field-layout change in the current codebase. Revisit after adding
+the F30 calibration matrix and an INT4 NEON kernel for `gate_up`/`down`;
+otherwise the experiment would either be the previously rejected naive INT4
+variant or a no-bandwidth-savings fake INT4 path. No code was kept.
+
+### F8: f16 KV cache with a native f16 attention kernel
+
+Change:
+- Audited the KV cache and attention call boundary.
+- `KvCache` stores both K and V as `Vec<f32>`.
+- `k_write_pos`/`v_write_pos`, `decoder_prefill`, and `decoder_forward` all
+  write f32 K/V values into that cache.
+- `causal_attention` and `causal_attention_heads` accept `*const f32` K/V bases
+  and scan f32 cache rows directly. There is no existing f16/half attention
+  entry point to reuse.
+
+Results:
+- No code change was made. Replacing only the cache storage with f16 would need
+  to expand K/V back to f32 before the current attention kernel, repeating the
+  previously rejected storage-only f16 approach rather than testing F8.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F8 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 600 ms |
+| segmented | 446 ms |
+| streaming | 490 ms |
+| overall average | 512.0 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F8 needs a new native f16 attention kernel that
+consumes packed f16 K/V directly. A storage-only patch would add conversion
+overhead without reducing the actual attention scan bandwidth. No code was
+kept. The speed run above was noticeably slower than adjacent no-change runs,
+so treat it as the benchmark artifact for this audit label, not as an F8-caused
+regression.
+
+### F10: E-core weight prestreaming for the next decoder layer
+
+Change:
+- Audited the thread-pool and scheduling support needed for a truthful
+  prestreaming A/B.
+- The project already detects the number of Apple Silicon performance cores and
+  intentionally sizes the hot decode pool to P-cores only; comments note that
+  adding efficiency cores made decode slower.
+- `parallel_for` dispatches work to the existing hot pool and has no E-core
+  affinity, QoS, or `os_workgroup`/work-interval binding.
+- Spawning ordinary Rust helper threads to read layer `L+1` weights while layer
+  `L` computes would not guarantee E-core placement and would likely contend
+  with the P-core decode pool. Spawning per layer would also benchmark thread
+  creation overhead, not prestreaming.
+
+Results:
+- No code change was made. A valid F10 implementation needs a persistent helper
+  with explicit low-priority/E-core scheduling or a macOS workgroup strategy.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F10 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 608 ms |
+| segmented | 436 ms |
+| streaming | 495 ms |
+| overall average | 513.0 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** The idea is still plausible, but without E-core
+placement controls the local patch would measure uncontrolled CPU contention.
+No code was kept. Like F8, this no-change speed label ran slower than the
+accepted F22 reference, so it is recorded as the artifact for this audit rather
+than a performance claim about F10.
+
+### F11: selective deferred `mlock` of hot decode weights
+
+Change:
+- Implemented a temporary `Decoder`-owned background worker that collected the
+  INT8 decode weight buffers (`wq/wk/wv/wo`, fused `gate_up`, `down`, and
+  `lm_head`) and called best-effort `mlock` on their page-aligned ranges.
+- Kept a `JoinHandle` inside `Decoder` and joined it in `Drop`, so the worker
+  could not outlive the underlying `Vec<i8>` allocations.
+
+Results:
+- Speed (`bench/run.sh --runs 10`):
+
+| Mode | F22 | F11 mlock | Delta |
+|------|----:|----------:|------:|
+| offline | 462.5 ms | 618 ms | +33.6% |
+| segmented | 343.5 ms | 468 ms | +36.2% |
+| streaming | 362.0 ms | 482 ms | +33.1% |
+| overall average | 389.3 ms | 522.7 ms | +34.3% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | F11 mlock |
+|--------|----------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected.** WER stayed under the gate, but speed regressed badly.
+The most likely causes are `mlock` system-call cost, memory-pressure/lock-limit
+effects, or the background worker competing with model load/inference instead
+of improving hot decode locality on an idle benchmark. Code was reverted; only
+this result is retained.
+
+### F12: pre-swizzled SDOT weight layout
+
+Change:
+- Audited the current NEON INT8 matvec layout and callers.
+- `neon::matvec_int8` already streams each row contiguously in 16/32-byte
+  blocks with `vld1q_s8` and computes two output rows at a time.
+- `int8_matvec_threaded`, QKV, SwiGLU, and argmax all assume row-major
+  addressing (`start * in_dim`, `row * in_dim`) and slice the same packed data
+  differently depending on output partitioning.
+- A genuine pre-swizzled format would need a new weight layout contract plus
+  matching kernels for ordinary matvec, fused QKV, fused gate/up SwiGLU, down
+  projection, and lm-head argmax. Repacking only at load while feeding the
+  current kernels would break results; repacking then unswizzling before the
+  current kernels would not test F12.
+
+Results:
+- No code change was made.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F12 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 620 ms |
+| segmented | 460 ms |
+| streaming | 470 ms |
+| overall average | 516.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** The current row-major SDOT kernel is already close to
+the simple contiguous streaming layout. F12 should be revisited only as a
+coordinated kernel/layout change, likely together with F19's sidecar artifact
+format so the swizzled layout can be generated once and mmap'd directly. No
+code was kept.
+
+### F14: BNNS direct convolution for conv2/conv3
+
+Change:
+- Audited the encoder convolution stem. The current path runs 3x3 stride-2
+  padded convolutions as im2col plus `cblas_sgemm`.
+- Wrote a temporary C probe outside the repo using
+  `BNNSFilterCreateLayerConvolution` with `BNNSDataLayoutImageCHW` inputs and
+  `BNNSDataLayoutConvolutionWeightsOIHW` weights, matching the current CHW/OIHW
+  memory layout.
+- Probed representative real conv shapes with random f32 data:
+  conv2-like `480x64x100 -> 480x32x50` and
+  conv3-like `480x32x50 -> 480x16x25`.
+
+Probe result:
+
+| Shape | BNNS direct conv | im2col + SGEMM |
+|-------|-----------------:|---------------:|
+| conv2-like | 7.077 ms | 6.136 ms |
+| conv3-like | 1.280 ms | 1.556 ms |
+
+Results:
+- No code change was made. BNNS won on the smaller conv3-like shape but lost on
+  the larger conv2-like shape, which is the heavier layer.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no BNNS integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 604 ms |
+| segmented | 474 ms |
+| streaming | 470 ms |
+| overall average | 516.0 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected/deferred.** The probe did not justify replacing the
+current im2col+SGEMM path wholesale. A partial conv3-only integration would add
+deprecated BNNS filter setup, descriptor lifetime management, and numeric parity
+risk for at most a small fraction of encoder time. Revisit only with BNNSGraph
+or if profiling shows conv3 alone has become a clear bottleneck. No code was
+kept.
+
+### F15: encoder window batching probe
+
+Change:
+- Audited the encoder forward path to test the premise that attention/FFN GEMMs
+  are issued per `enc_n_window_infer` window.
+- The convolution stem is processed per encoder chunk, but after stem projection
+  all encoder transformer buffers are sized for `total_tokens`.
+- Q/K/V, attention output projection, FFN `fc1/fc2`, `proj1`, and `proj2` call
+  `linear_bf16_scratch`/`linear_accumulate_bf16_scratch` with `M =
+  total_tokens`, not one window at a time.
+- `window_starts` is only passed into `bidirectional_attention` to constrain
+  attention ranges; it does not split the encoder GEMMs.
+
+Results:
+- No code change was made. There is no local window-batching opportunity in the
+  current encoder transformer GEMM path because it is already batched across the
+  full encoded token sequence.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F15 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 607 ms |
+| segmented | 462 ms |
+| streaming | 466 ms |
+| overall average | 511.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Rejected/deferred.** The original C6 concern does not apply to the
+current encoder transformer implementation. Future batching work should target
+the per-chunk convolution stem or multi-request/session batching, not
+per-window encoder GEMM batching. No code was kept.
+
+### F17: CPU/AMX overlap inside the encoder
+
+Change:
+- Audited the encoder GEMM wrappers and synchronization points.
+- `linear_bf16_scratch` and `linear_accumulate_bf16_scratch` synchronously
+  convert BF16 weights into a shared f32 scratch buffer and then synchronously
+  call the current `linear`/`linear_accumulate` SGEMM path.
+- The current API returns only after both conversion and SGEMM are complete; it
+  has no in-flight GEMM handle that would let CPU work such as next im2col,
+  norms, activations, or softmax run concurrently.
+- Reordering this safely would require dedicated GEMM worker ownership, scratch
+  double-buffering, and a dependency schedule through the encoder layer graph.
+  It is finer-grained and riskier than the already deferred F16 pipeline.
+
+Results:
+- No code change was made. A superficial thread spawn around `cblas_sgemm`
+  would add synchronization overhead without exposing independent CPU work in
+  the current call structure.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F17 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 636 ms |
+| segmented | 462 ms |
+| streaming | 482 ms |
+| overall average | 526.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F17 remains an architecture-level scheduling
+experiment, but the current synchronous scratch+SGEMM API gives no low-risk
+place to overlap useful CPU work with AMX work. Revisit after F16/F27 or after
+introducing an explicit asynchronous GEMM/scratch ownership abstraction. No
+code was kept.
+
+### F18: Winograd F(2x2, 3x3) for encoder convs
+
+Change:
+- Ran a profile pass to check F18's re-entry condition after the F14 BNNS probe.
+- The current offline profile still shows convolution as a real bucket:
+  `conv2d_op_ms = 70.1 ms` out of `total_ms = 480.0 ms` in the profile run
+  (`14.6%` of inference).
+- Audited the convolution implementation: all three stem convolutions share one
+  im2col+SGEMM implementation with stride 2 and padding 1; E6 previously showed
+  chunk-boundary/padding sensitivity.
+
+Results:
+- No code change was made. A correct Winograd implementation would need a new
+  transformed kernel for the stride-2 padded CHW stem, careful boundary
+  handling, and numeric parity validation across chunk sizes. A quick
+  direct-conv rewrite would risk changing ASR behavior and would not be a
+  faithful low-risk F(2x2, 3x3) experiment.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F18 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 614 ms |
+| segmented | 444 ms |
+| streaming | 474 ms |
+| overall average | 510.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** Conv remains large enough to care about, but F18 is a
+new convolution algorithm, not a local scheduling or layout tweak. Revisit only
+with a standalone Winograd parity harness for the exact stride/padding/chunk
+semantics, then integrate behind the usual WER gate. No code was kept.
+
+### F21: pipeline load with inference stages
+
+Change:
+- Audited the model load and transcription boundary.
+- `QwenCtx::load` is currently a pure model-construction API: it opens
+  safetensors, detects config, synchronously loads `Encoder`, synchronously
+  loads `Decoder`, then constructs KV/encoder/decoder scratch state.
+- Audio samples, mel computation, and `Encoder::forward` live on the
+  transcription side after a full `QwenCtx` has already been returned.
+- Starting encoder inference while decoder loading continues would require a
+  staged context or a one-shot load-and-transcribe API that can hold a
+  partially initialized context, run mel/encoder after `Encoder::load`, and
+  join decoder loading before decoder prefill.
+
+Results:
+- No code change was made. The current public surfaces (CLI, C API, JNI/Flutter
+  bridge, streaming push API) all assume a fully loaded `QwenCtx` before
+  transcription starts.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F21 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 636 ms |
+| segmented | 453 ms |
+| streaming | 476 ms |
+| overall average | 521.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F21 is feasible, but it is a staged-load API change,
+not a local load-order tweak. Revisit when adding a one-shot cold-start
+benchmark/API or during the F27 shared-weight/session split, where partial
+model state can be represented cleanly. No code was kept.
+
+### F24: LLVM BOLT post-link optimization
+
+Change:
+- Checked the current benchmark platform and binary format.
+- Current environment is Darwin arm64 (`RELEASE_ARM64_T6050`), and
+  `target/release/qwen-asr` is a Mach-O 64-bit arm64 executable.
+- No `llvm-bolt`/`bolt` tool is available in this environment.
+- The idea in `fable-ideas.md` is explicitly scoped to Linux/x86 OpenBLAS
+  targets because BOLT is not available for macOS ld64/Mach-O output.
+
+Results:
+- No code or build-flow change was made.
+- Speed (`bench/run.sh --runs 10`, current accepted macOS arm64 code, no BOLT):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 610 ms |
+| segmented | 462 ms |
+| streaming | 469 ms |
+| overall average | 513.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Not applicable on this platform.** F24 still belongs to a future
+Linux/x86 benchmark track, ideally after a Linux gate exists and after PGO
+training has been revisited. No code was kept.
+
+### F26: `os_workgroup` / explicit workload hints
+
+Change:
+- Audited the current macOS scheduling hooks and SDK APIs.
+- The codebase has no existing QoS, `os_workgroup`, work-interval, or thread
+  policy calls; the hot `parallel_for` pool is a plain persistent worker pool.
+- macOS exposes `os_workgroup_interval_start/update/finish`, but the interval
+  API requires member threads to have joined an interval workgroup.
+- The available public creation entry point in this SDK is
+  `AudioWorkIntervalCreate`, documented for audio realtime threads. Using it
+  for ASR inference would require linking AudioToolbox, owning an interval
+  object, and teaching all relevant worker threads to join/leave that workgroup
+  around repeated decode/encode work.
+
+Results:
+- No code change was made. A small wrapper around the main thread would not
+  affect the existing worker pool and would mostly test unsupported/mis-scoped
+  API usage rather than F26's intended workload hint.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F26 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 617 ms |
+| segmented | 468 ms |
+| streaming | 470 ms |
+| overall average | 518.3 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred.** F26 needs a deliberate macOS scheduling experiment
+that includes worker membership and interval lifecycle. The current code shape
+has no safe low-cost hook that would exercise the intended mechanism. No code
+was kept.
+
+### F28: parallel long-audio segmentation
+
+Change:
+- Audited the current segmented transcription loop and context ownership.
+- `transcribe_segmented` computes split points, then processes segments
+  serially with one mutable `QwenCtx`.
+- Every segment calls `transcribe_segment(ctx, ...)`, sharing mutable encoder
+  buffers, decoder buffers, KV cache, RoPE cache, prompt state, tokenizer/model
+  path state, and perf counters.
+- Running segments in parallel without F27 would require duplicating the full
+  model per worker or unsafely sharing mutable session state.
+
+Results:
+- No code change was made. A correct F28 implementation still depends on the
+  F27 split into shared immutable weights plus per-worker session state, and it
+  also needs a long-audio benchmark gate rather than the current single 28 s
+  sample.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F28 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 470 ms |
+| segmented | 358 ms |
+| streaming | 364 ms |
+| overall average | 397.3 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred, blocked by F27.** F28 remains a good long-audio
+throughput target, but the current code has no independent session object to
+run in parallel. Revisit after F27 and after adding a long-file benchmark to
+make the speed gate meaningful. No code was kept.
+
+### F29: daemon / server mode
+
+Change:
+- Audited CLI and embedding surfaces for an existing resident server mode.
+- There is no `--serve`, TCP listener, or daemon loop in the CLI.
+- The C/JNI embedding APIs already let a host process load a `QwenCtx` once and
+  call transcription repeatedly, but the benchmark gate launches a fresh CLI
+  process per run and therefore includes no repeated-request residency test.
+- A daemon/server implementation would need a request protocol, lifecycle and
+  shutdown behavior, concurrency policy, and a benchmark that separates first
+  request from warm resident requests.
+
+Results:
+- No code change was made. A daemon would not improve the current single-run
+  `bench/run.sh` inference gate, whose reported inference timer already
+  excludes process startup and model load.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F29 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 474 ms |
+| segmented | 344 ms |
+| streaming | 366 ms |
+| overall average | 394.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred / benchmark-not-covered.** F29 is useful for repeated
+requests and product embedding, but it needs a resident-server benchmark rather
+than the current one-shot CLI gate. No code was kept.
+
+### F30: activation-aware weight-role calibration matrix
+
+Change:
+- Audited the existing quantization and benchmark tooling.
+- The runtime has per-row INT8 decode quantization and historical WER runs, but
+  there is no offline harness that sweeps tensor roles, formats, group sizes,
+  zero-points, and activation-aware scale search across a calibration corpus.
+- F30 is the prerequisite that would make F2/F3 calibrated INT4 experiments
+  measurable instead of ad hoc.
+
+Results:
+- No code change was made. A useful F30 implementation is a separate offline
+  calibration/sweep program plus result matrix, not a direct runtime
+  optimization.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F30 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 649 ms |
+| segmented | 461 ms |
+| streaming | 512 ms |
+| overall average | 540.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred / tooling track.** F30 should be built as an offline
+calibration matrix before revisiting calibrated INT4, f16 role selection, or
+other WER-sensitive compression. No runtime code was kept.
+
+### F31: structured sparsity or magnitude pruning of decoder weights
+
+Change:
+- Audited the current decode kernels for sparse/pruned support.
+- All hot decode kernels are dense INT8 SDOT scans over contiguous row-major
+  weights (`matvec_int8`, fused QKV, fused SwiGLU, down projection, and
+  `argmax_int8_range`).
+- There is no 2:4 metadata format, sparse row iterator, sparse SDOT kernel, or
+  pruning/fine-tuning pipeline.
+
+Results:
+- No code change was made. Zeroing weights without a sparse kernel would not
+  reduce bandwidth, and pruning without fine-tuning/calibration would be a
+  WER-risk experiment rather than a safe speed patch.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F31 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 628 ms |
+| segmented | 460 ms |
+| streaming | 488 ms |
+| overall average | 525.3 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred / research track.** F31 needs both a model-compression
+pipeline and a sparse decode kernel. Revisit only after F30-style calibration
+and preferably after F2/F3 determines whether dense INT4 is enough. No code was
+kept.
+
+### F32: train/distill a tiny draft model for true speculative decoding
+
+Change:
+- Audited the repo for a draft-model training, distillation, or runtime
+  verifier path.
+- The current runtime loads one Qwen ASR decoder and the existing speculative
+  notes cover algorithm sketches only; there is no tiny draft model artifact,
+  training pipeline, or batched verifier API.
+- F32 is a model-building track rather than a local runtime-only patch.
+
+Results:
+- No code change was made. Implementing this safely requires a compatible draft
+  decoder trained on the same tokenizer/audio-conditioning contract, plus a
+  verifier path that can score multiple proposed tokens in one pass.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F32 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 608 ms |
+| segmented | 462 ms |
+| streaming | 474 ms |
+| overall average | 514.7 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred / model-training track.** F32 is promising, but this repo
+does not yet have the draft model, distillation data path, or multi-token
+verifier needed to make it a faithful speculative-decoding experiment. No code
+was kept.
+
+### F33: encoder token merging / output downsampling
+
+Change:
+- Audited the encoder-to-decoder boundary for token merging or output
+  downsampling hooks.
+- `Encoder::forward` returns a dense `enc_output` plus `total_tokens` after the
+  convolution stem, encoder transformer, and final projection.
+- `transcribe_segment` copies every encoder token into the decoder prompt and
+  `decoder_prefill` processes the full sequence. There is no existing
+  merge-policy hook, similarity metric, or WER guard for dropping/averaging
+  encoder tokens.
+
+Results:
+- No code change was made. A naive stride-2 or averaging pass after the encoder
+  would change the acoustic-token contract seen by the decoder and is expected
+  to be WER-sensitive without a tuned policy or retraining.
+- Speed (`bench/run.sh --runs 10`, current accepted code, no F33 integration):
+
+| Mode | Current accepted code |
+|------|----------------------:|
+| offline | 471 ms |
+| segmented | 362 ms |
+| streaming | 362 ms |
+| overall average | 398.3 ms |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | Current accepted code |
+|--------|----------------------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Deferred / WER-sensitive model-contract change.** F33 needs a
+separate token-merge policy experiment with a WER sweep, and possibly decoder
+adaptation, before it can be treated as a safe runtime optimization. No code
+was kept.
+
+### B9: overlap lm_head argmax with next-token start
+
+Change:
+- In `decoder_forward`, after the final RMS norm, run the `lm_head` argmax and
+  the next-position preparation (`kv_cache.grow(next_pos + 1)` and
+  `rope.ensure(next_pos + 1, ...)`) in parallel via `std::thread::scope`.
+- The next decode step's KV-cache capacity and RoPE tables are independent of
+  the argmax result, so they can be prepared while the vocabulary is still being
+  scored.
+
+Baseline for this experiment is the post-`LONG_AUDIO_FAST`-removal HEAD
+(`f28145c`, `bench/run.sh --runs 10`):
+
+| Mode | Baseline | B9 overlap | Delta |
+|------|---------:|-----------:|------:|
+| offline | 587.0 ms | 578.0 ms | −1.5% |
+| segmented | 456.0 ms | 446.5 ms | −2.1% |
+| streaming | 503.0 ms | 505.5 ms | +0.5% |
+| overall average | 515.2 ms | 510.0 ms | −1.0% |
+
+- 100-file LibriSpeech offline WER:
+
+| Metric | B9 overlap |
+|--------|-----------:|
+| Corpus WER | 0.0387 |
+| Macro WER | 0.0428 |
+| Corpus CER | 0.0154 |
+
+Decision: **Accepted.** WER is unchanged and all offline/segmented modes show a
+small speed improvement; streaming is within noise. The change is low-risk and
+removes a small serial dependency at the end of each decode step. The code was
+kept in `crates/qwen-asr/src/decoder.rs`.

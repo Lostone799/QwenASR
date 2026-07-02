@@ -21,20 +21,6 @@ const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
-// P0 fix (2026-06-21): for any input above 15 seconds the decoder was
-// previously capped at 6 tokens (`LONG_AUDIO_FAST_MAX_TOKENS`), which on
-// slow CPUs (e.g. Intel N95 / Gracemont, ~2-3 s per token) translates
-// to ~6 Chinese characters of output and appears to the user as
-// "识别卡在 9 个字". The fast-path was originally tuned for P-core
-// CPUs where 6 tokens is acceptable; on E-core it is unusable.
-//
-// We now scale the token cap with audio duration for ALL lengths
-// (the previous 15 s boundary is removed). 8 tokens / second matches
-// the rule used in stt-lite and is enough for any Chinese speech
-// rate. Users on a P-core CPU who hit a slow decode can still cap
-// the result with the GUI's `stream_max_new_tokens` parameter.
-const LONG_AUDIO_TOKEN_RATE: f64 = 8.0;
-const LONG_AUDIO_TOKEN_MIN: i32 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrefillRowKey {
@@ -328,13 +314,7 @@ fn transcribe_segment(
 
     // Autoregressive decode
     let t0 = get_time_ms();
-    // Dynamic max_tokens: scale linearly with audio duration for all
-    // lengths. See comment on LONG_AUDIO_TOKEN_RATE for why the previous
-    // fast-path cap (6 tokens) was wrong on slow CPUs.
-    let audio_sec = ctx.perf_audio_ms / 1000.0;
-    let max_tokens = (LONG_AUDIO_TOKEN_MIN as f64)
-        .max(audio_sec * LONG_AUDIO_TOKEN_RATE)
-        as i32;
+    let max_tokens = 2048;
     let mut n_generated = 0;
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
@@ -565,8 +545,8 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
         let start_ms = (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
         let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
 
-        // Set perf_audio_ms to this segment's duration so the token budget
-        // is per-segment, not the full file (avoids the 6-token fast-cap).
+        // Set perf_audio_ms to this segment's duration so any per-segment
+        // token budgets are relative to the segment, not the full file.
         ctx.perf_audio_ms = 1000.0 * seg_len as f64 / SAMPLE_RATE as f64;
 
         let seg_buf: Vec<f32>;
@@ -773,11 +753,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
     let rollback = ctx.stream_rollback;
     let unfixed_chunks = ctx.stream_unfixed_chunks;
-    // Default 32 tokens per chunk is fine for streaming; we no longer
-    // cap at LONG_AUDIO_FAST_MAX_TOKENS for long inputs (that fast-path
-    // constant was 6 — a typo, see comment on LONG_AUDIO_TOKEN_RATE).
-    // Long audio is handled by the chunked / LCP-reuse path below.
-    let mut max_new_tokens = if ctx.stream_max_new_tokens > 0 {
+    let max_new_tokens = if ctx.stream_max_new_tokens > 0 {
         ctx.stream_max_new_tokens
     } else {
         32
