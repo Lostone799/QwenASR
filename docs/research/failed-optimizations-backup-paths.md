@@ -9,9 +9,9 @@
 ## 备用路径 #1: oneDNN conv2d 替代
 
 ### 状态
-- **当前结论**: FAIL (i5-10400 上 oneDNN 446ms vs P1 AVX2 386ms, 慢 15.5%)
+- **当前结论**: FAIL (i5-10400 上 oneDNN 446ms vs P1 AVX2 386ms, 慢 15.5%；FFI 路径导致 access violation 崩溃)
 - **代码保留**: `crates/qwen-asr/src/kernels/onednn.rs` (FFI 模块完整保留)
-- **运行时开关**: `QWEN_ASR_DISABLE_ONEDNN=1` (默认禁用，env 控制)
+- **运行时开关**: `QWEN_ASR_ENABLE_ONEDNN=1` (**默认禁用**，需显式启用)
 - **依赖**: `dnnl.dll` (oneDNN 3.7.1, 自编译于 `c:\Users\Administrator\clawd\onednn_build`)
 
 ### FAIL 根因
@@ -27,11 +27,11 @@ oneDNN 的 primitive 创建、内存格式转换、调度开销 > JIT conv2d 收
 | **conv2d 调用频率增大** (更大 encoder) | primitive 创建开销被摊薄 | 在更大模型上重测 |
 
 ### 重启用步骤
-1. 设置环境变量不禁用: `Remove-Item Env:QWEN_ASR_DISABLE_ONEDNN` (默认即启用)
+1. 设置环境变量启用: `$env:QWEN_ASR_ENABLE_ONEDNN="1"` (默认禁用)
 2. 确保 `dnnl.dll` 在 PATH 中
 3. 运行: `.\target\release\qwen-asr.exe -d models\... -i audio.wav -S 0 --profile`
-4. 对比 `conv2d_op` 行: oneDNN 路径 vs `QWEN_ASR_DISABLE_ONEDNN=1` P1 路径
-5. 若 oneDNN ≤ P1 的 80%，标记为 PASS 并启用默认路径
+4. 对比 `conv2d_op` 行: oneDNN 路径 (ENABLE=1) vs P1 路径 (默认)
+5. 若 oneDNN ≤ P1 的 80%，标记为 PASS 并可考虑改默认启用
 
 ### 关键代码位置
 - FFI 加载: `kernels/onednn.rs:OnednnLib::load()`

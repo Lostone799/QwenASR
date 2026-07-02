@@ -48,6 +48,12 @@ pub struct QwenCtx {
     // Segmentation settings
     pub segment_sec: f32,
     pub search_sec: f32,
+    /// When `true` (default in v0.2+), `transcribe_segmented` reuses
+    /// the prefix K/V cache across segments. Set to `false` via
+    /// `--no-segment-kv-reuse` to force a full re-prefill on every
+    /// segment (the v0.1 behavior) — useful for A/B benchmarking
+    /// and for diagnosing K/V reuse regressions.
+    pub segment_reuse_prefix_kv: bool,
 
     // Streaming settings
     pub stream_chunk_sec: f32,
@@ -151,6 +157,7 @@ impl QwenCtx {
             token_cb: None,
             segment_sec: 0.0,
             search_sec: 3.0,
+            segment_reuse_prefix_kv: true,
             stream_chunk_sec: 8.0,
             stream_rollback: 5,
             stream_unfixed_chunks: 99,
@@ -233,7 +240,11 @@ impl QwenCtx {
                 }
             }
         } else {
-            self.force_prompt_tokens = Some(vec![11528, 6364, TOKEN_ASR_TEXT]);
+            // Default to Chinese: previously hardcoded to English via [11528, 6364]
+            // ("language English"), which caused Chinese audio to be misrecognized
+            // as English. Token 8453 = " Chinese" (ĠChinese), replacing 6364 = " English".
+            // Keep the same 3-token layout to preserve embedding/KV-cache boundaries.
+            self.force_prompt_tokens = Some(vec![11528, 8453, TOKEN_ASR_TEXT]);
         }
 
         self.prompt_tokens_ready = true;

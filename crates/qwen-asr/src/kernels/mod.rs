@@ -5,8 +5,52 @@ pub mod generic;
 pub mod neon;
 #[cfg(target_arch = "x86_64")]
 pub mod avx;
+#[cfg(target_arch = "x86_64")]
+pub mod conv2d_3x3;
+#[cfg(windows)]
+pub mod onednn;
+
 
 use std::thread;
+
+// CPU microarchitecture detection for P1 kernel allowlist.
+#[cfg(target_arch = "x86_64")]
+pub fn is_low_power_e_core() -> bool {
+    use std::arch::x86_64::__cpuid;
+    unsafe {
+        // Leaf 0x1A is supported if the maximum basic leaf is at least 0x1A.
+        let max_basic = __cpuid(0).eax;
+        if max_basic < 0x1A {
+            return false;
+        }
+        let cpuid = __cpuid(0x1A);
+        let core_type = (cpuid.eax >> 24) & 0xFF;
+        // 0x20 = Atom (Gracemont/Tremont), 0x40 = Core (Skylake+).
+        core_type == 0x20
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn is_low_power_e_core() -> bool {
+    false
+}
+
+pub fn p1_should_be_enabled() -> bool {
+    if std::env::var("QWEN_ASR_FORCE_P1")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if std::env::var("QWEN_ASR_DISABLE_P1")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // Enable P1 only on low-power E-cores; disable on Skylake+ P-cores.
+    is_low_power_e_core()
+}
 
 // BLAS extern bindings
 #[cfg(all(feature = "blas", target_vendor = "apple"))]
@@ -1842,11 +1886,20 @@ fn im2col(input: &[f32], cols: &mut [f32], c_in: usize, h_in: usize, w_in: usize
 pub fn conv2d(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32]>,
               c_in: usize, c_out: usize, h_in: usize, w_in: usize,
               kh: usize, kw: usize, stride: usize, padding: usize) {
-    let _pg = ProfileGuard::new(&PROF.conv2d_op);
     let h_out = (h_in + 2 * padding - kh) / stride + 1;
     let w_out = (w_in + 2 * padding - kw) / stride + 1;
     let patch_size = c_in * kh * kw;
     let spatial_out = h_out * w_out;
+
+    // Try oneDNN path first (Windows only). On failure, fall back silently.
+    #[cfg(windows)]
+    if onednn::onednn_enabled()
+        && onednn::conv2d_onednn(
+            out, input, weight, bias, c_in, c_out, h_in, w_in, kh, kw, stride, padding,
+        )
+    {
+        return;
+    }
 
     let mut cols = vec![0.0f32; patch_size * spatial_out];
     conv2d_impl(out, input, weight, bias, &mut cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, false);
@@ -1861,7 +1914,21 @@ pub fn conv2d_with_cols(out: &mut [f32], input: &[f32], weight: &[f32], bias: Op
     let w_out = (w_in + 2 * padding - kw) / stride + 1;
     let patch_size = c_in * kh * kw;
     let spatial_out = h_out * w_out;
-    cols.resize(patch_size * spatial_out, 0.0);
+
+    // Try oneDNN path first (Windows only). On failure, fall back silently.
+    #[cfg(windows)]
+    if onednn::onednn_enabled()
+        && onednn::conv2d_onednn(
+            out, input, weight, bias, c_in, c_out, h_in, w_in, kh, kw, stride, padding,
+        )
+    {
+        return;
+    }
+
+    let required = patch_size * spatial_out;
+    if cols.len() < required {
+        cols.resize(required, 0.0);
+    }
     conv2d_impl(out, input, weight, bias, cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, false);
 }
 
@@ -1885,6 +1952,241 @@ pub fn conv2d_with_cols_gelu(out: &mut [f32], input: &[f32], weight: &[f32], bia
     let spatial_out = h_out * w_out;
     cols.resize(patch_size * spatial_out, 0.0);
     conv2d_impl(out, input, weight, bias, cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding, true);
+}
+
+/// P1 hand-written 3×3 stride=2 padding=1 conv2d for the audio
+/// encoder stem. Currently only supports `c_in=1, c_out=480`
+/// (encoder layer 1) on x86_64 with AVX2+FMA. Other shapes fall
+/// back to the P0 path (`conv2d_with_cols_gelu`).
+///
+/// **CPU feature gate**: AVX2 + FMA must be detected at runtime.
+/// On non-x86_64 or pre-AVX2 CPUs this returns `false` and the
+/// caller must use the P0 path.
+///
+/// Activation is fused (tanh-GELU).
+///
+/// Returns `true` on success, `false` if the path is not supported
+/// for the given shape / platform.
+#[cfg(target_arch = "x86_64")]
+pub fn conv2d_3x3_s2_p1_avx2(
+    out: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    c_in: usize,
+    c_out: usize,
+    h_in: usize,
+    w_in: usize,
+) -> bool {
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        return false;
+    }
+    // Only layer 1 (1 → 480) is implemented in P1 step 1.
+    if c_in != 1 || c_out != 480 {
+        return false;
+    }
+    let h_out = (h_in + 2 - 3) / 2 + 1;
+    let w_out = (w_in + 2 - 3) / 2 + 1;
+    let spatial_out = h_out * w_out;
+    if out.len() < c_out * spatial_out {
+        return false;
+    }
+    if weight.len() < c_out * 9 || bias.len() < c_out {
+        return false;
+    }
+
+    let _pg = ProfileGuard::new(&PROF.conv2d_op);
+
+    unsafe {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                conv2d_3x3::conv2d_3x3_s2_p1_avx2_1_to_480(
+                    input.as_ptr(),
+                    weight.as_ptr(),
+                    bias.as_ptr(),
+                    out.as_mut_ptr(),
+                    oh,
+                    ow,
+                    h_in,
+                    w_in,
+                    h_out,
+                    w_out,
+                );
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn conv2d_3x3_s2_p1_avx2(
+    _out: &mut [f32],
+    _input: &[f32],
+    _weight: &[f32],
+    _bias: &[f32],
+    _c_in: usize,
+    _c_out: usize,
+    _h_in: usize,
+    _w_in: usize,
+) -> bool {
+    false
+}
+
+/// P1 parallel wrapper for the generic 3×3 stride=2 padding=1
+/// direct conv2d kernel. Parallelises over output-channel groups
+/// (8 per AVX2 lane). Falls back to P0 (im2col + sgemm) on
+/// unsupported platforms or shapes.
+///
+/// `c_in` and `c_out` must be multiples of 8.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_3x3_s2_p1_parallel(
+    out: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    c_in: usize,
+    c_out: usize,
+    h_in: usize,
+    w_in: usize,
+) -> bool {
+    // P1 kernel allowlist: enabled only on low-power E-cores by default.
+    // QWEN_ASR_FORCE_P1=1 can override, QWEN_ASR_DISABLE_P1=1 can disable.
+    static ENABLE_P1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enable = *ENABLE_P1.get_or_init(p1_should_be_enabled);
+    if !enable {
+        return false;
+    }
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        return false;
+    }
+    if c_out % 8 != 0 || c_in == 0 {
+        return false;
+    }
+    let h_out = (h_in + 2 - 3) / 2 + 1;
+    let w_out = (w_in + 2 - 3) / 2 + 1;
+    let spatial_out = h_out * w_out;
+    if out.len() < c_out * spatial_out {
+        return false;
+    }
+    if weight.len() < c_out * c_in * 9 || bias.len() < c_out {
+        return false;
+    }
+    let _pg = ProfileGuard::new(&PROF.conv2d_op);
+
+    // All shapes use the generic kernel with pre-transposed weights.
+    // (c_in==1 specialised kernel had a weight layout bug — using it
+    //  requires the same transpose, so we unify on the generic path.)
+    let wt = transpose_conv2d_weights_for_p1(weight, c_out);
+    conv2d_3x3_s2_p1_inner(out, input, &wt, bias, c_in, c_out, h_in, w_in, h_out, w_out)
+}
+
+/// Transpose conv2d weights from `[c_out, c_in*9]` to `[n_groups, c_in*9, 8]`
+/// where `n_groups = c_out / 8`. This allows the AVX2 kernel to load 8 output
+/// channel weights with a single `_mm256_loadu_ps`.
+pub fn transpose_conv2d_weights_for_p1(weight: &[f32], c_out: usize) -> Vec<f32> {
+    let n_groups = c_out / 8;
+    let patch = weight.len() / c_out; // c_in * 9
+    let mut wt = vec![0.0f32; n_groups * patch * 8];
+    for g in 0..n_groups {
+        let oc_base = g * 8;
+        for ic_k in 0..patch {
+            for lane in 0..8usize {
+                wt[g * patch * 8 + ic_k * 8 + lane] =
+                    weight[(oc_base + lane) * patch + ic_k];
+            }
+        }
+    }
+    wt
+}
+
+/// Inner implementation that uses pre-transposed weights.
+#[cfg(target_arch = "x86_64")]
+fn conv2d_3x3_s2_p1_inner(
+    out: &mut [f32], input: &[f32], wt: &[f32], bias: &[f32],
+    c_in: usize, c_out: usize, h_in: usize, w_in: usize,
+    h_out: usize, w_out: usize,
+) -> bool {
+    let n_groups = c_out / 8;
+    let n_threads = get_num_threads();
+
+    if n_threads <= 1 || n_groups <= 1 {
+        unsafe {
+            conv2d_3x3::conv2d_3x3_s2_p1_generic(
+                input.as_ptr(), wt.as_ptr(), bias.as_ptr(), out.as_mut_ptr(),
+                c_in, c_out, h_in, w_in, h_out, w_out, 0, c_out,
+            );
+        }
+    } else {
+        let input_ptr = input.as_ptr() as usize;
+        let wt_ptr = wt.as_ptr() as usize;
+        let bias_ptr = bias.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        parallel_for(|tid, nt| {
+            let (g_start, g_end) = match parallel_chunk_range(n_groups, tid, nt) {
+                Some(r) => r,
+                None => return,
+            };
+            let oc_start = g_start * 8;
+            let oc_end = g_end * 8;
+            unsafe {
+                conv2d_3x3::conv2d_3x3_s2_p1_generic(
+                    input_ptr as *const f32,
+                    wt_ptr as *const f32,
+                    bias_ptr as *const f32,
+                    out_ptr as *mut f32,
+                    c_in, c_out, h_in, w_in, h_out, w_out,
+                    oc_start, oc_end,
+                );
+            }
+        });
+    }
+    true
+}
+
+/// Variant that uses pre-transposed weights (from `transpose_conv2d_weights_for_p1`).
+/// Avoids per-call transposition overhead.
+#[cfg(target_arch = "x86_64")]
+pub fn conv2d_3x3_s2_p1_pretransposed(
+    out: &mut [f32], input: &[f32], weight_t: &[f32], bias: &[f32],
+    c_in: usize, c_out: usize, h_in: usize, w_in: usize,
+) -> bool {
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        return false;
+    }
+    if c_out % 8 != 0 || c_in == 0 || c_in == 1 {
+        return false;
+    }
+    let h_out = (h_in + 2 - 3) / 2 + 1;
+    let w_out = (w_in + 2 - 3) / 2 + 1;
+    if out.len() < c_out * h_out * w_out || bias.len() < c_out {
+        return false;
+    }
+    let _pg = ProfileGuard::new(&PROF.conv2d_op);
+    conv2d_3x3_s2_p1_inner(out, input, weight_t, bias, c_in, c_out, h_in, w_in, h_out, w_out)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_3x3_s2_p1_parallel(
+    _out: &mut [f32], _input: &[f32], _weight: &[f32], _bias: &[f32],
+    _c_in: usize, _c_out: usize, _h_in: usize, _w_in: usize,
+) -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn transpose_conv2d_weights_for_p1(weight: &[f32], _c_out: usize) -> Vec<f32> {
+    weight.to_vec()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn conv2d_3x3_s2_p1_pretransposed(
+    _out: &mut [f32], _input: &[f32], _weight_t: &[f32], _bias: &[f32],
+    _c_in: usize, _c_out: usize, _h_in: usize, _w_in: usize,
+) -> bool {
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3085,3 +3387,279 @@ pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim:
 
     reduce_argmax(&best_indices, &best_vals, n_threads)
 }
+
+#[cfg(test)]
+mod conv2d_tests {
+    use super::*;
+
+    /// Scalar reference: conv2d 3x3 stride=2 padding=1 + tanh-GELU.
+    fn conv2d_ref(input: &[f32], weight: &[f32], bias: &[f32],
+                  c_in: usize, c_out: usize, h_in: usize, w_in: usize) -> Vec<f32> {
+        let h_out = (h_in + 2 - 3) / 2 + 1;
+        let w_out = (w_in + 2 - 3) / 2 + 1;
+        let spatial_out = h_out * w_out;
+        let mut out = vec![0.0f32; c_out * spatial_out];
+
+        for oc in 0..c_out {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut acc = bias[oc];
+                    for ic in 0..c_in {
+                        for kh in 0..3usize {
+                            let ih_signed = (oh * 2 + kh) as isize - 1;
+                            if ih_signed < 0 || ih_signed as usize >= h_in { continue; }
+                            let ih = ih_signed as usize;
+                            for kw in 0..3usize {
+                                let iw_signed = (ow * 2 + kw) as isize - 1;
+                                if iw_signed < 0 || iw_signed as usize >= w_in { continue; }
+                                let iw = iw_signed as usize;
+                                let w_idx = oc * (c_in * 9) + ic * 9 + kh * 3 + kw;
+                                let i_idx = ic * h_in * w_in + ih * w_in + iw;
+                                acc += weight[w_idx] * input[i_idx];
+                            }
+                        }
+                    }
+                    // tanh-GELU
+                    let x3 = acc * acc * acc;
+                    let inner = 0.7978845608028654f32 * (acc + 0.044715 * x3);
+                    let result = 0.5 * acc * (1.0 + inner.tanh());
+
+                    out[oc * spatial_out + oh * w_out + ow] = result;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_conv2d_3x3_s2_small() {
+        // Absolute minimum: c_in=2, c_out=8, h_in=4, w_in=4
+        // This gives h_out=2, w_out=2, spatial_out=4
+        let c_in = 2;
+        let c_out = 8;
+        let h_in = 4;
+        let w_in = 4;
+
+        // All ones input, simple weights, zero bias
+        let input: Vec<f32> = vec![1.0; c_in * h_in * w_in];
+        let mut weight = vec![0.0f32; c_out * c_in * 9];
+        // oc=0: ic=0 all 9 weights = 1.0, ic=1 weights = 0.0
+        weight[0..9].fill(1.0);
+        let bias = vec![0.0; c_out];
+
+        let h_out = (h_in + 2 - 3) / 2 + 1;
+        let w_out = (w_in + 2 - 3) / 2 + 1;
+        let spatial_out = h_out * w_out;
+
+        let reference = conv2d_ref(&input, &weight, &bias, c_in, c_out, h_in, w_in);
+
+        // Manual check: oc=0, oh=0, ow=0
+        // kh=0: ih=-1 skip. kh=1: ih=0. kh=2: ih=1.
+        // ic=0: kw=0(iw=-1) skip; kw=1(iw=0)→1; kw=2(iw=1)→1  for kh=1,2 = 4
+        // ic=1: all weights=0 → 0
+        // Total = 4. GELU(4) ≈ 4.0
+        assert!((reference[0] - 4.0).abs() < 0.1, "Reference bug: ref[0]={}", reference[0]);
+
+        let mut p1_out = vec![0.0f32; c_out * spatial_out];
+        let ok = conv2d_3x3_s2_p1_parallel(
+            &mut p1_out, &input, &weight, &bias, c_in, c_out, h_in, w_in,
+        );
+
+        if !ok {
+            eprintln!("SKIP: AVX2+FMA not detected");
+            return;
+        }
+
+        let mut max_err = 0.0f32;
+        let mut worst_pos = (0usize, 0usize, 0usize);
+        for idx in 0..reference.len() {
+            let err = (reference[idx] - p1_out[idx]).abs();
+            if err > max_err {
+                max_err = err;
+                let oc = idx / spatial_out;
+                let s = idx % spatial_out;
+                let oh = s / w_out;
+                let ow = s % w_out;
+                worst_pos = (oc, oh, ow);
+            }
+        }
+        let (woc, woh, wow) = worst_pos;
+        let widx = woc * spatial_out + woh * w_out + wow;
+
+        assert!(max_err < 0.01,
+            "conv2d P1 vs reference: max_err={} at oc={} oh={} ow={} ref={} p1={} (c_in={}, c_out={}, h={}, w={})",
+            max_err, woc, woh, wow, reference[widx], p1_out[widx], c_in, c_out, h_in, w_in);
+    }
+
+    #[test]
+    fn test_conv2d_3x3_s2_encoder_shapes() {
+        // Encoder-like shapes: c_in=480, c_out=480 (layers 2/3)
+        let c_in = 480;
+        let c_out = 480;
+        let h_in = 16;
+        let w_in = 32;
+
+        let input: Vec<f32> = (0..c_in * h_in * w_in)
+            .map(|i| ((i * 17 + 11) % 1000) as f32 * 0.002 - 1.0)
+            .collect();
+        let weight: Vec<f32> = (0..c_out * c_in * 9)
+            .map(|i| ((i * 31 + 7) % 2000) as f32 * 0.001 - 1.0)
+            .collect();
+        let bias: Vec<f32> = (0..c_out).map(|i| (i as f32 - 240.0) * 0.01).collect();
+
+        let h_out = (h_in + 2 - 3) / 2 + 1;
+        let w_out = (w_in + 2 - 3) / 2 + 1;
+        let spatial_out = h_out * w_out;
+
+        let reference = conv2d_ref(&input, &weight, &bias, c_in, c_out, h_in, w_in);
+
+        let mut p1_out = vec![0.0f32; c_out * spatial_out];
+        let ok = conv2d_3x3_s2_p1_parallel(
+            &mut p1_out, &input, &weight, &bias, c_in, c_out, h_in, w_in,
+        );
+
+        if !ok {
+            eprintln!("SKIP: AVX2+FMA not detected");
+            return;
+        }
+
+        let mut max_err = 0.0f32;
+        let mut worst_pos = (0usize, 0usize, 0usize);
+        for idx in 0..reference.len() {
+            let err = (reference[idx] - p1_out[idx]).abs();
+            if err > max_err {
+                max_err = err;
+                let oc = idx / spatial_out;
+                let s = idx % spatial_out;
+                let oh = s / w_out;
+                let ow = s % w_out;
+                worst_pos = (oc, oh, ow);
+            }
+        }
+        let (woc, woh, wow) = worst_pos;
+        let widx = woc * spatial_out + woh * w_out + wow;
+
+        // Tolerance for 480-channel accumulation (float32 rounding)
+        assert!(max_err < 0.1,
+            "conv2d P1 480->480 vs reference: max_err={} at oc={} oh={} ow={} ref={} p1={}",
+            max_err, woc, woh, wow, reference[widx], p1_out[widx]);
+    }
+}
+
+#[cfg(test)]
+mod int8_matvec_tests {
+    use super::avx;
+    use super::quantize_f32_to_int8;
+
+    /// Scalar reference for INT8 matvec.
+    /// The kernel uses XOR-0x80 sign-flip + finalize_int8(-128*w_sum) which undoes the flip,
+    /// so the final output equals the true signed dot product × scales + bias.
+    /// y[o] = (sum_i x_int8[i]*w[o,i]) * x_scale * w_scale[o] + bias[o]
+    fn int8_matvec_ref(
+        x_int8: &[i8], x_scale: f32,
+        w_int8: &[i8], w_scales: &[f32], w_sums: &[i32],
+        bias: Option<&[f32]>,
+        in_dim: usize, out_dim: usize,
+    ) -> Vec<f32> {
+        let _ = w_sums; // w_sums not needed: finalize_int8 cancels the XOR-0x80 offset
+        let mut y = vec![0.0f32; out_dim];
+        for o in 0..out_dim {
+            let mut s: i32 = 0;
+            for i in 0..in_dim {
+                s += x_int8[i] as i32 * w_int8[o * in_dim + i] as i32;
+            }
+            let mut val = s as f32 * x_scale * w_scales[o];
+            if let Some(b) = bias { val += b[o]; }
+            y[o] = val;
+        }
+        y
+    }
+
+    /// Verify matvec_int8_avx2 matches scalar reference across out_dim edge cases
+    /// that exercise 4-row, 2-row, and 1-row tail paths.
+    #[test]
+    fn test_matvec_int8_avx2_4row_correctness() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: AVX2 not available");
+            return;
+        }
+        let in_dim = 256usize;
+        // Weights in -50..50 to avoid PMADDUBSW i16 saturation (max pair sum 2*255*50=25500 < 32767).
+        // Edge cases: 1-3 (pure tail), 4 (single 4-row block), 5-7 (4-row + tail),
+        // 8 (two 4-row blocks), 9/12/15/16/17 (mixed)
+        for &out_dim in &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17] {
+            let mut w_int8: Vec<i8> = Vec::with_capacity(out_dim * in_dim);
+            let mut w_scales: Vec<f32> = Vec::with_capacity(out_dim);
+            let mut w_sums: Vec<i32> = Vec::with_capacity(out_dim);
+            for o in 0..out_dim {
+                w_scales.push(0.01 + (o as f32) * 0.001);
+                let mut row_sum: i32 = 0;
+                for i in 0..in_dim {
+                    let v = (((o * 7 + i * 3) % 101) - 50) as i8; // -50..50
+                    w_int8.push(v);
+                    row_sum += v as i32;
+                }
+                w_sums.push(row_sum);
+            }
+            // Quantize x using the SAME function the kernel uses (guarantees identical x_int8/x_scale)
+            let x: Vec<f32> = (0..in_dim).map(|i| ((i % 50) as f32 - 25.0) * 0.1).collect();
+            let (x_int8, x_scale) = quantize_f32_to_int8(&x);
+            let bias: Vec<f32> = (0..out_dim).map(|o| o as f32 * 0.5).collect();
+
+            let y_ref = int8_matvec_ref(&x_int8, x_scale, &w_int8, &w_scales, &w_sums, Some(&bias), in_dim, out_dim);
+
+            let mut y_simd = vec![0.0f32; out_dim];
+            unsafe {
+                avx::matvec_int8_avx2(
+                    &mut y_simd, x_int8.as_ptr(), x_scale,
+                    w_int8.as_ptr(), &w_scales, &w_sums, Some(&bias),
+                    in_dim, out_dim,
+                );
+            }
+
+            for o in 0..out_dim {
+                let diff = (y_simd[o] - y_ref[o]).abs();
+                let tol = (y_ref[o].abs() * 1e-4 + 1e-3).max(1e-2);
+                assert!(diff < tol,
+                    "out_dim={} o={}: simd={} ref={} diff={}", out_dim, o, y_simd[o], y_ref[o], diff);
+            }
+        }
+    }
+
+    /// Verify matvec_int8_avx2 works without bias (None path).
+    #[test]
+    fn test_matvec_int8_avx2_no_bias() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: AVX2 not available");
+            return;
+        }
+        let in_dim = 256usize;
+        for &out_dim in &[4usize, 8, 12] {
+            let w_int8: Vec<i8> = (0..out_dim * in_dim)
+                .map(|i| (((i * 5) % 101) - 50) as i8)
+                .collect();
+            let w_sums: Vec<i32> = (0..out_dim)
+                .map(|o| w_int8[o * in_dim..(o + 1) * in_dim].iter().map(|&v| v as i32).sum())
+                .collect();
+            let w_scales: Vec<f32> = (0..out_dim).map(|o| 0.01 + o as f32 * 0.001).collect();
+            let x: Vec<f32> = (0..in_dim).map(|i| ((i % 30) as f32 - 15.0) * 0.1).collect();
+            let (x_int8, x_scale) = quantize_f32_to_int8(&x);
+
+            let y_ref = int8_matvec_ref(&x_int8, x_scale, &w_int8, &w_scales, &w_sums, None, in_dim, out_dim);
+            let mut y_simd = vec![0.0f32; out_dim];
+            unsafe {
+                avx::matvec_int8_avx2(
+                    &mut y_simd, x_int8.as_ptr(), x_scale,
+                    w_int8.as_ptr(), &w_scales, &w_sums, None,
+                    in_dim, out_dim,
+                );
+            }
+            for o in 0..out_dim {
+                let diff = (y_simd[o] - y_ref[o]).abs();
+                let tol = (y_ref[o].abs() * 1e-4 + 1e-3).max(1e-2);
+                assert!(diff < tol, "no_bias out_dim={} o={}: simd={} ref={}", out_dim, o, y_simd[o], y_ref[o]);
+            }
+        }
+    }
+}
+
