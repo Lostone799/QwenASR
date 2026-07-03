@@ -342,10 +342,6 @@ fn transcribe_segment(
                 cb(&String::from_utf8_lossy(piece_bytes));
             }
 
-            if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
-                break;
-            }
-
             // Repetition detection: check if tail contains repeated blocks
             // (ref: stt-lite pattern detection)
             recent_text.extend_from_slice(piece_bytes);
