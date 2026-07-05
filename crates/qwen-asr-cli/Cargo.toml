@@ -14,6 +14,10 @@ readme = "README.md"
 name = "qwen-asr"
 path = "src/main.rs"
 
+[features]
+default = ["blas"]
+blas = ["qwen-asr/blas"]
+
 [dependencies]
 qwen-asr = { workspace = true, default-features = false }
 ureq = "2"

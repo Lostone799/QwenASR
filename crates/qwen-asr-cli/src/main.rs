@@ -120,10 +120,13 @@ fn usage(prog: &str) {
     eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
     eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
     eprintln!("  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)");
-    eprintln!("  --stream-chunk-sec <secs>   Chunk size for streaming (default: 2.0, min ~1.0)");
+    eprintln!("  --stream-chunk-sec <secs>   Chunk size for streaming or offline chunked mode (default: 2.0, min ~1.0)");
+    eprintln!("  --refine-interval <secs>    Two-stage: stream draft + refine whole audio every N secs (default: 0=off)");
     eprintln!("  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)");
     eprintln!("  --past-text <yes|no|auto>  Reuse previously decoded text as context");
-    eprintln!("  --skip-silence              Drop long silent spans before inference");
+    eprintln!("  --skip-silence              Drop long silent spans before inference (default: on)");
+  eprintln!("  --keep-silence              Keep silent spans (disable --skip-silence)");
+  eprintln!("  --no-segment-kv-reuse       Disable prefix KV cache reuse across segments (v0.1 behavior; default reuses)");
     eprintln!("  --prompt <text>            System prompt for biasing");
     eprintln!("  --language <lang>          Force output language");
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
@@ -199,12 +202,14 @@ fn main() {
     let mut vad_mode = false;
     let mut stream_max_new_tokens: i32 = -1;
     let mut stream_chunk_sec: f32 = -1.0;
+    let mut refine_interval_sec: f32 = 0.0; // 0 = disabled, >0 = refine every N seconds
     let mut enc_window_sec: f32 = -1.0;
     let mut prompt_text: Option<String> = None;
     let mut force_language: Option<String> = None;
     let mut past_text_mode: i32 = -1; // -1 auto, 0 off, 1 on
-    let mut skip_silence = false;
+    let mut skip_silence: Option<bool> = None; // None = ctx default
     let mut profile = false;
+    let mut no_segment_kv_reuse = false;
     let mut align_text: Option<String> = None;
     let mut align_language: Option<String> = None;
     // None = no SRT, Some(path) = write SRT to path
@@ -249,6 +254,10 @@ fn main() {
                 i += 1;
                 stream_chunk_sec = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
             }
+            "--refine-interval" => {
+                i += 1;
+                refine_interval_sec = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            }
             "--enc-window-sec" => {
                 i += 1;
                 enc_window_sec = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
@@ -266,7 +275,13 @@ fn main() {
                 }
             }
             "--skip-silence" => {
-                skip_silence = true;
+                skip_silence = Some(true);
+            }
+            "--keep-silence" => {
+                skip_silence = Some(false);
+            }
+            "--no-segment-kv-reuse" => {
+                no_segment_kv_reuse = true;
             }
             "--prompt" => {
                 i += 1;
@@ -486,8 +501,15 @@ fn main() {
     } else if stream_mode {
         ctx.past_text_conditioning = true;
     }
-    if skip_silence {
-        ctx.skip_silence = true;
+    // `--skip-silence` enables silence compaction (default ON
+    // because ctx.skip_silence defaults to true). `--keep-silence`
+    // forces it OFF for benchmarking or for users who want raw
+    // timeline accuracy.
+    if let Some(v) = skip_silence {
+        ctx.skip_silence = v;
+    }
+    if no_segment_kv_reuse {
+        ctx.segment_reuse_prefix_kv = false;
     }
     if let Some(ref prompt) = prompt_text {
         if ctx.set_prompt(prompt).is_err() {
@@ -663,7 +685,30 @@ fn main() {
         let samples = preloaded_samples
             .or_else(|| load_audio(input_wav.as_ref().unwrap()));
         match samples {
-            Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
+            Some(s) => {
+                if refine_interval_sec > 0.0 && stream_chunk_sec > 0.0 {
+                    eprintln!(
+                        "Two-stage mode: stream chunk={}s, refine every {}s",
+                        stream_chunk_sec, refine_interval_sec
+                    );
+                    transcribe::transcribe_streaming_with_refine(
+                        &mut ctx,
+                        &s,
+                        refine_interval_sec,
+                        |idx, text, total_ms, tokens| {
+                            eprintln!(
+                                "--- Refine #{}: {:.0}ms, {} tokens ---",
+                                idx, total_ms, tokens
+                            );
+                            eprintln!("{}", text);
+                        },
+                    )
+                } else if stream_chunk_sec > 0.0 {
+                    transcribe::transcribe_streaming(&mut ctx, &s)
+                } else {
+                    transcribe::transcribe_audio(&mut ctx, &s)
+                }
+            }
             None => None,
         }
     };

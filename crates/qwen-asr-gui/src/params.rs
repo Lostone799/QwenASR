@@ -19,6 +19,10 @@ pub struct AsrParams {
     pub stream_max_new_tokens: i32,
     /// Stream chunk size in seconds (-1 = auto)
     pub stream_chunk_sec: f32,
+    /// Enable two-stage refinement: streaming draft + periodic whole-audio re-transcription
+    pub refine_enabled: bool,
+    /// Interval (seconds) between refinement passes during streaming
+    pub refine_interval_sec: f32,
     /// Skip silence in audio
     pub skip_silence: bool,
     /// Past text conditioning mode (0=off, 1=on)
@@ -41,7 +45,9 @@ impl Default for AsrParams {
             search_sec: -1.0,        // auto
             enc_window_sec: -1.0,    // auto
             stream_max_new_tokens: -1, // auto
-            stream_chunk_sec: -1.0,  // auto
+            stream_chunk_sec: 4.0,   // 4s chunks: 2s 仍导致 chunk#1 空转(0 tokens)
+            refine_enabled: false,  // 禁用整块修正：358s 推理太慢，用户无反馈
+            refine_interval_sec: 30.0, // refine every 30s of accumulated audio
             skip_silence: false,
             past_text_mode: 1,        // on (recommended for streaming)
             profile: false,
@@ -72,9 +78,18 @@ impl AsrParams {
         if self.past_text_mode >= 0 {
             ctx.past_text_conditioning = self.past_text_mode == 1;
         }
-        if self.skip_silence {
-            ctx.skip_silence = true;
-        }
+        // 显式设置 skip_silence：AsrParams.default() 为 false，
+        // 而 QwenCtx::load 默认为 true。必须总是设置才能让 AsrParams
+        // 的 false 覆盖 QwenCtx::load 的默认 true，避免实时模式丢字。
+        ctx.skip_silence = self.skip_silence;
+
+        // 实时流式出字关键：QwenCtx::load 默认 stream_unfixed_chunks=99，
+        // 意味着前 99 个 chunk 内 token_cb 永远不会被调用。
+        // 设为 0 让第一个 chunk 就发射 token。
+        ctx.stream_unfixed_chunks = 0;
+        // rollback 控制每个 chunk 末尾保留多少 token 不发射（防抖动）。
+        // 默认 5 太大。设为 1：最小延迟，仅保留最后 1 个 token 防抖。
+        ctx.stream_rollback = 1;
     }
 
     /// Apply thread settings globally

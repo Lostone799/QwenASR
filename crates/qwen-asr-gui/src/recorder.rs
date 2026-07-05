@@ -148,4 +148,10 @@ impl MicRecorder {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    /// 返回内部样本缓冲区的 Arc 句柄，供实时识别线程读取。
+    /// 录音停止后此 Arc 仍然有效，线程可读取最终累积的样本。
+    pub fn samples_arc(&self) -> Arc<Mutex<Vec<f32>>> {
+        self.samples.clone()
+    }
 }

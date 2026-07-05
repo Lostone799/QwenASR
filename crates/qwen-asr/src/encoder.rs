@@ -132,6 +132,15 @@ impl EncoderBuffers {
         self.c3.resize(CONV_HIDDEN * h3 * w3, 0.0);
         self.reshaped.resize(w3 * conv_proj_dim, 0.0);
         self.pe.resize(w3 * d_model, 0.0);
+
+        // Pre-size conv_cols for the largest im2col buffer used by the stem.
+        // Layer 2/3 use CONV_HIDDEN input channels and dominate the size.
+        let max_patch = CONV_HIDDEN * 3 * 3;
+        let spatial_out_l2 = h2 * w2;
+        let required_cols = max_patch * spatial_out_l2;
+        if self.conv_cols.len() < required_cols {
+            self.conv_cols.resize(required_cols, 0.0f32);
+        }
     }
 }
 
@@ -413,69 +422,62 @@ impl Encoder {
             }
 
             // Conv2D layer 1: [1, 128, chunk_w] -> [480, h1, w1]
-            // Fused with GELU activation (P0 v0.3) — saves one full
-            // sweep over c1 (~150 KB) plus the parallel_for dispatch.
             let h1 = (128 + 2 - 3) / 2 + 1; // 64
             let w1 = (chunk_w + 2 - 3) / 2 + 1;
             let c1 = &mut bufs.c1[..CONV_HIDDEN * h1 * w1];
-            kernels::conv2d_with_cols_gelu(
-                c1,
-                chunk_mel,
-                &self.conv1_weight,
-                Some(&self.conv1_bias),
-                &mut bufs.conv_cols,
-                1,
-                CONV_HIDDEN,
-                128,
-                chunk_w,
-                3,
-                3,
-                2,
-                1,
+            // P1: try hand-written 3×3 stride=2 AVX2 kernel (no fused GELU)
+            let ok = kernels::conv2d_3x3_s2_p1_parallel(
+                c1, chunk_mel, &self.conv1_weight, &self.conv1_bias,
+                1, CONV_HIDDEN, 128, chunk_w,
             );
+            if !ok {
+                // P0 fallback: im2col + sgemm + bias-add + GELU
+                kernels::conv2d_with_cols(
+                    c1, chunk_mel, &self.conv1_weight, Some(&self.conv1_bias),
+                    &mut bufs.conv_cols, 1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1,
+                );
+                kernels::gelu(c1, CONV_HIDDEN * h1 * w1);
+            } else {
+                // P1 path: apply SIMD GELU separately
+                kernels::gelu(c1, CONV_HIDDEN * h1 * w1);
+            }
 
             // Conv2D layer 2: [480, h1, w1] -> [480, h2, w2]
-            // Fused with GELU activation (P0 v0.3).
             let h2 = (h1 + 2 - 3) / 2 + 1; // 32
             let w2 = (w1 + 2 - 3) / 2 + 1;
             let c2 = &mut bufs.c2[..CONV_HIDDEN * h2 * w2];
-            kernels::conv2d_with_cols_gelu(
-                c2,
-                c1,
-                &self.conv2_weight,
-                Some(&self.conv2_bias),
-                &mut bufs.conv_cols,
-                CONV_HIDDEN,
-                CONV_HIDDEN,
-                h1,
-                w1,
-                3,
-                3,
-                2,
-                1,
+            let ok = kernels::conv2d_3x3_s2_p1_parallel(
+                c2, c1, &self.conv2_weight, &self.conv2_bias,
+                CONV_HIDDEN, CONV_HIDDEN, h1, w1,
             );
+            if !ok {
+                kernels::conv2d_with_cols(
+                    c2, c1, &self.conv2_weight, Some(&self.conv2_bias),
+                    &mut bufs.conv_cols, CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1,
+                );
+                kernels::gelu(c2, CONV_HIDDEN * h2 * w2);
+            } else {
+                kernels::gelu(c2, CONV_HIDDEN * h2 * w2);
+            }
 
             // Conv2D layer 3: [480, h2, w2] -> [480, h3, w3]
-            // Fused with GELU activation (P0 v0.3).
             let h3 = (h2 + 2 - 3) / 2 + 1; // 16
             let _w3_calc = (w2 + 2 - 3) / 2 + 1;
             debug_assert_eq!(_w3_calc, w3);
             let c3 = &mut bufs.c3[..CONV_HIDDEN * h3 * w3];
-            kernels::conv2d_with_cols_gelu(
-                c3,
-                c2,
-                &self.conv3_weight,
-                Some(&self.conv3_bias),
-                &mut bufs.conv_cols,
-                CONV_HIDDEN,
-                CONV_HIDDEN,
-                h2,
-                w2,
-                3,
-                3,
-                2,
-                1,
+            let ok = kernels::conv2d_3x3_s2_p1_parallel(
+                c3, c2, &self.conv3_weight, &self.conv3_bias,
+                CONV_HIDDEN, CONV_HIDDEN, h2, w2,
             );
+            if !ok {
+                kernels::conv2d_with_cols(
+                    c3, c2, &self.conv3_weight, Some(&self.conv3_bias),
+                    &mut bufs.conv_cols, CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 3, 2, 1,
+                );
+                kernels::gelu(c3, CONV_HIDDEN * h3 * w3);
+            } else {
+                kernels::gelu(c3, CONV_HIDDEN * h3 * w3);
+            }
 
             // Reshape [480, h3, w3] -> [w3, 480*h3]
             // Loop order: ch → f → t for sequential reads from c3

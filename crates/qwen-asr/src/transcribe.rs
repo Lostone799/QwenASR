@@ -119,11 +119,32 @@ fn load_tokenizer(model_dir: &str) -> Option<QwenTokenizer> {
 }
 
 /// Transcribe a single segment. Returns (text, n_text_tokens).
+///
+/// `reuse_prefix_kv`:
+/// - `false` (default, used by `transcribe_audio` and the first call
+///   from `transcribe_segmented`): reset `kv_cache.len = 0` and run a
+///   full prefill over the entire `input_embeds` sequence. This is
+///   the safe baseline behavior and produces bit-identical output to
+///   v0.1.
+/// - `true` (used by follow-up calls in `transcribe_segmented`):
+///   assume the caller has just run a previous segment and the
+///   decoder's KV cache already holds the K/V for the **prefix**
+///   portion of the input (`PREFIX_HEAD + prompt_tokens + PREFIX_TAIL`,
+///   `prefix_len` tokens in total) at positions `[0..prefix_len)`.
+///   The segment's encoder output and suffix differ from the previous
+///   segment, so they need fresh K/V written to positions
+///   `[prefix_len..total_seq-1]`. The function truncates
+///   `kv_cache.len` to `prefix_len` (discarding any prior
+///   encoder/suffix/decode K/V from earlier segments) and runs a
+///   delta prefill over `input_embeds[prefix_len*dim..]` of length
+///   `total_seq - prefix_len - 1`. The first decode token is then
+///   generated from the last prefill position.
 fn transcribe_segment(
     ctx: &mut QwenCtx,
     samples: &[f32],
     tokenizer: &QwenTokenizer,
     past_tokens: Option<&[i32]>,
+    reuse_prefix_kv: bool,
 ) -> Option<(String, i32)> {
     let cfg = &ctx.config.clone();
     let dim = cfg.dec_hidden;
@@ -280,24 +301,57 @@ fn transcribe_segment(
 
     // Decoder prefill
     let t0 = get_time_ms();
-    ctx.kv_cache.len = 0;
-    let prefill_len = total_seq - 1;
+    // Trim the KV cache to the prefix boundary before prefill. In
+    // `reuse_prefix_kv` mode this discards the previous segment's
+    // encoder/suffix/decode K/V (positions `[prefix_len..]`), keeping
+    // only the K/V that corresponds to the system prompt + chat
+    // template (`[0..prefix_len)`). In baseline mode this is just
+    // `0`, matching the v0.1 behavior.
+    ctx.kv_cache.len = prefix_len;
+    let (prefill_input, prefill_len) = if reuse_prefix_kv {
+        // Only the encoder + suffix portion of input_embeds needs
+        // fresh K/V; prefix K/V is reused from the cache. We
+        // prefill the suffix + the "last_embed" token — total_seq - 1
+        // positions from the new region. Note: `last_embed` is
+        // taken from position `prefill_len` below, so we prefill
+        // `total_seq - prefix_len - 1` tokens here (encoder + suffix,
+        // minus the last token whose K/V we use for the first decode
+        // step).
+        let skip = prefix_len * dim;
+        let new_len = total_seq - prefix_len - 1;
+        (&input_embeds[skip..], new_len)
+    } else {
+        (input_embeds.as_slice(), total_seq - 1)
+    };
     decoder::decoder_prefill(
         &ctx.decoder,
         cfg,
         &mut ctx.kv_cache,
         &mut ctx.rope_cache,
         &mut ctx.dec_bufs,
-        &input_embeds,
+        prefill_input,
         prefill_len,
     );
 
-    // Release F32 prefill weights — no longer needed after prefill completes.
-    // This saves ~50% of decoder memory for the 1.7B model.
-    ctx.decoder.free_prefill_weights();
+    // Release no F32 prefill weights — they were never allocated in
+    // the first place. INT8 quantized weights are used for both
+    // prefill and decode, and the bf16 path keeps a single copy
+    // (`*_weight_bf16`) used by the bf16 fallback. There is no
+    // "second copy" to free. (The historical `free_prefill_weights`
+    // helper was a no-op that reset always-None Option fields —
+    // removed in v0.2.)
 
     // First token from last prefill position
-    let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
+    // `prefill_len` above was a delta count (or total_seq-1 in the
+    // baseline path); convert to the absolute position of the last
+    // prefill token, which is where the next decode step takes its
+    // input embedding from.
+    let last_prefill_pos = if reuse_prefix_kv {
+        prefix_len + prefill_len
+    } else {
+        prefill_len
+    };
+    let last_embed = &input_embeds[last_prefill_pos * dim..(last_prefill_pos + 1) * dim];
     let mut token = decoder::decoder_forward(
         &ctx.decoder,
         cfg,
@@ -320,8 +374,15 @@ fn transcribe_segment(
 
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut tmp_embed = vec![0.0f32; dim];
-    // Repetition detection state (ref: stt-lite)
-    let mut recent_text: Vec<u8> = Vec::new();
+    // Repetition detection state (ref: stt-lite). Fixed-size ring
+    // buffer of the last RECENT_TEXT_CAP bytes — zero heap growth
+    // even on 8000-token runs. `len` is the number of valid bytes
+    // (caps at RECENT_TEXT_CAP); bytes are stored contiguously from
+    // index 0, oldest dropped first, so the tail slice
+    // `&buf[len-20..len]` is just a view — no copy, no to_vec().
+    const RECENT_TEXT_CAP: usize = 20;
+    let mut recent_text_buf: [u8; RECENT_TEXT_CAP] = [0u8; RECENT_TEXT_CAP];
+    let mut recent_text_len: usize = 0;
 
     while n_generated < max_tokens {
         n_generated += 1;
@@ -343,10 +404,28 @@ fn transcribe_segment(
             }
 
             // Repetition detection: check if tail contains repeated blocks
-            // (ref: stt-lite pattern detection)
-            recent_text.extend_from_slice(piece_bytes);
-            if recent_text.len() > 20 {
-                let tail = &recent_text[recent_text.len().saturating_sub(20)..];
+            // (ref: stt-lite pattern detection). Append each piece's
+            // bytes to the ring buffer, dropping the oldest when full.
+            // `recent_text_len` is capped at RECENT_TEXT_CAP so the
+            // tail view below is always exactly the last 20 bytes.
+            for &b in piece_bytes {
+                if recent_text_len < RECENT_TEXT_CAP {
+                    recent_text_buf[recent_text_len] = b;
+                    recent_text_len += 1;
+                } else {
+                    // Shift left by 1 (cheap: at most RECENT_TEXT_CAP
+                    // moves per token byte; not on the hot path
+                    // because we only enter this block when text is
+                    // already at the cap).
+                    recent_text_buf.copy_within(1..RECENT_TEXT_CAP, 0);
+                    recent_text_buf[RECENT_TEXT_CAP - 1] = b;
+                }
+            }
+            if recent_text_len == RECENT_TEXT_CAP {
+                // Buffer is full; the full slice is exactly the
+                // last 20 bytes — same as the old
+                // `recent_text[recent_text.len() - 20..]`.
+                let tail: &[u8] = &recent_text_buf[..RECENT_TEXT_CAP];
                 let mut is_repeating = false;
                 for rep_len in 2..=4usize {
                     if rep_len > tail.len() / 2 {
@@ -512,7 +591,7 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
         } else {
             samples
         };
-        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, &tokenizer, None, false) {
             if !text.is_empty() {
                 segments.push(TranscriptSegment { start_ms, end_ms, text });
             }
@@ -538,6 +617,17 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
         let seg_end = if s + 1 < n_splits { splits[s + 1] } else { samples.len() };
         let seg_len = seg_end - seg_start;
 
+        // Reuse the system-prompt KV cache (the prefix portion) on
+        // follow-up segments. The first segment must still do a
+        // full prefill to seed the cache. This is a v0.2
+        // optimization: the previous design (`ctx.kv_cache.len = 0`
+        // on every call) recomputed prefix K/V for every segment,
+        // wasting `prefix_len` INT8 matvecs per segment.
+        // Controlled by `ctx.segment_reuse_prefix_kv` (default
+        // `true`); set to `false` via `--no-segment-kv-reuse` to
+        // restore the v0.1 behavior for A/B benchmarking.
+        let reuse_prefix_kv = s > 0 && ctx.segment_reuse_prefix_kv;
+
         let start_ms = (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
         let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
 
@@ -557,7 +647,7 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
             &samples[seg_start..seg_end]
         };
 
-        let (text, _) = match transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+        let (text, _) = match transcribe_segment(ctx, seg_ptr, &tokenizer, None, reuse_prefix_kv) {
             Some(r) => r,
             None => continue,
         };
@@ -621,7 +711,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
     // No splitting if segment_sec is 0 or audio fits in one segment
     if ctx.segment_sec <= 0.0 || audio_samples.len() <= target_samples + margin_samples {
-        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
+        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None, false)?;
         return Some(text);
     }
 
@@ -687,7 +777,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         };
 
         let (seg_text, _seg_text_tokens) =
-            match transcribe_segment(ctx, seg_ptr, &tokenizer, past_tokens.as_deref()) {
+            match transcribe_segment(ctx, seg_ptr, &tokenizer, past_tokens.as_deref(), false) {
             Some(r) => r,
             None => continue,
         };
@@ -738,6 +828,226 @@ pub fn transcribe_stdin(ctx: &mut QwenCtx) -> Option<String> {
     transcribe_audio(ctx, &samples)
 }
 
+/// Offline chunked transcription: split long audio into fixed-length chunks,
+/// transcribe each chunk independently, and concatenate the results.
+///
+/// This is intended to limit peak memory for very long inputs: each chunk is
+/// processed as a separate transcription with a fresh KV cache and buffers,
+/// so encoder/decoder state does not grow with total audio duration.
+///
+/// Chunk duration is controlled by `ctx.stream_chunk_sec`. If the option is
+/// not set or the audio fits in a single chunk, this falls back to
+/// [`transcribe_audio`].
+pub fn transcribe_streaming(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
+    let chunk_sec = ctx.stream_chunk_sec;
+    if chunk_sec <= 0.0 {
+        return transcribe_audio(ctx, samples);
+    }
+    let chunk_samples = (chunk_sec * SAMPLE_RATE as f32) as usize;
+    if chunk_samples == 0 || samples.len() <= chunk_samples {
+        return transcribe_audio(ctx, samples);
+    }
+
+    if kernels::verbose() >= 1 {
+        eprintln!(
+            "Streaming chunks: {:.1}s ({} samples) per chunk",
+            chunk_sec, chunk_samples
+        );
+    }
+
+    let saved_past_text = ctx.past_text_conditioning;
+    ctx.past_text_conditioning = true;
+
+    // Aggregate perf counters across chunks. `transcribe_audio` calls
+    // `reset_perf()` at its entry, so by the time the loop exits
+    // `ctx.perf_*` only reflects the LAST chunk. Without this
+    // aggregation the GUI would report token counts / timings for
+    // only the final chunk while `result` is the concatenation of all
+    // chunks (e.g. ~150-char Chinese text reported as 7 tokens, the
+    // count from the last chunk only).
+    let mut agg_text_tokens = 0i32;
+    let mut agg_total_ms = 0.0f64;
+    let mut agg_encode_ms = 0.0f64;
+    let mut agg_decode_ms = 0.0f64;
+    let mut agg_audio_ms = 0.0f64;
+
+    let mut result = String::new();
+    let mut chunk_start = 0usize;
+    while chunk_start < samples.len() {
+        let chunk_end = (chunk_start + chunk_samples).min(samples.len());
+        let chunk = &samples[chunk_start..chunk_end];
+        let text = transcribe_audio(ctx, chunk)?;
+        // transcribe_audio() reset_perf()'d at entry; its perf_* now
+        // holds this chunk's metrics — accumulate before the next
+        // iteration overwrites them.
+        agg_text_tokens += ctx.perf_text_tokens;
+        agg_total_ms += ctx.perf_total_ms;
+        agg_encode_ms += ctx.perf_encode_ms;
+        agg_decode_ms += ctx.perf_decode_ms;
+        agg_audio_ms += ctx.perf_audio_ms;
+        if !text.is_empty() {
+            if !result.is_empty() {
+                let prev = *result.as_bytes().last().unwrap_or(&0);
+                let next = *text.as_bytes().first().unwrap_or(&0);
+                if should_insert_boundary_space(prev, next) {
+                    result.push(' ');
+                }
+            }
+            result.push_str(&text);
+        }
+        chunk_start = chunk_end;
+    }
+    ctx.past_text_conditioning = saved_past_text;
+
+    // Restore aggregated perf counters so callers (GUI/CLI) see totals
+    // for the entire streaming call, not just the last chunk.
+    ctx.perf_text_tokens = agg_text_tokens;
+    ctx.perf_total_ms = agg_total_ms;
+    ctx.perf_encode_ms = agg_encode_ms;
+    ctx.perf_decode_ms = agg_decode_ms;
+    ctx.perf_audio_ms = agg_audio_ms;
+
+    Some(result)
+}
+
+/// Two-stage transcription: streaming draft + periodic whole-audio refinement.
+///
+/// This combines the latency benefit of [`transcribe_streaming`] (the user
+/// sees a live draft via `ctx.token_cb`) with the accuracy benefit of
+/// [`transcribe_audio`] on the full accumulated audio (which avoids chunk
+/// boundary errors).
+///
+/// # Algorithm
+/// 1. Stream chunks of `ctx.stream_chunk_sec` seconds, appending each
+///    chunk's text to the running draft (and invoking `token_cb`).
+/// 2. Every `refine_interval_sec` of accumulated audio, run a full
+///    `transcribe_audio` over `&samples[..chunk_start]` and call
+///    `on_refine(refine_idx, text, total_ms, text_tokens)`. The caller
+///    should replace the GUI's draft with this higher-accuracy text.
+///    During the refine pass `token_cb` is temporarily detached so the
+///    draft is not polluted with duplicate tokens.
+/// 3. After the last chunk, run a final refine over the entire audio
+///    and return its text.
+///
+/// `ctx.perf_*` after return reflects the **final refine** pass (not the
+/// streaming chunks), so the caller's `Done` status is consistent with
+/// the returned text.
+pub fn transcribe_streaming_with_refine<F>(
+    ctx: &mut QwenCtx,
+    samples: &[f32],
+    refine_interval_sec: f32,
+    mut on_refine: F,
+) -> Option<String>
+where
+    F: FnMut(u32, &str, f64, i32),
+{
+    let chunk_sec = ctx.stream_chunk_sec;
+    // Fall back to plain streaming if streaming or refine is disabled.
+    if chunk_sec <= 0.0 || refine_interval_sec <= 0.0 {
+        return transcribe_streaming(ctx, samples);
+    }
+
+    let chunk_samples = (chunk_sec * SAMPLE_RATE as f32) as usize;
+    let refine_samples = (refine_interval_sec * SAMPLE_RATE as f32) as usize;
+
+    // Audio fits in one chunk or chunks are too small — just transcribe.
+    if chunk_samples == 0 || samples.len() <= chunk_samples {
+        return transcribe_audio(ctx, samples);
+    }
+
+    if kernels::verbose() >= 1 {
+        eprintln!(
+            "Streaming+refine: chunk={:.1}s, refine every {:.1}s",
+            chunk_sec, refine_interval_sec
+        );
+    }
+
+    let saved_past_text = ctx.past_text_conditioning;
+    ctx.past_text_conditioning = true;
+
+    let mut result = String::new();
+    let mut chunk_start = 0usize;
+    let mut refine_idx = 0u32;
+    // First refine fires when accumulated audio reaches refine_samples.
+    let mut next_refine_at = refine_samples;
+
+    while chunk_start < samples.len() {
+        let chunk_end = (chunk_start + chunk_samples).min(samples.len());
+        let chunk = &samples[chunk_start..chunk_end];
+        let text = transcribe_audio(ctx, chunk)?;
+
+        if !text.is_empty() {
+            if !result.is_empty() {
+                let prev = *result.as_bytes().last().unwrap_or(&0);
+                let next = *text.as_bytes().first().unwrap_or(&0);
+                if should_insert_boundary_space(prev, next) {
+                    result.push(' ');
+                }
+            }
+            result.push_str(&text);
+        }
+
+        chunk_start = chunk_end;
+
+        // Periodic refine: re-transcribe the entire accumulated audio so
+        // far for higher accuracy. We detach token_cb so the draft
+        // (partial_text in the GUI) is not polluted with the refine's
+        // token stream — the caller will replace the draft wholesale via
+        // on_refine.
+        if chunk_start >= next_refine_at && chunk_start < samples.len() {
+            refine_idx += 1;
+            let saved_cb = ctx.token_cb.take();
+            let refined = transcribe_audio(ctx, &samples[..chunk_start]);
+            ctx.token_cb = saved_cb;
+            if let Some(ref refined_text) = refined {
+                if kernels::verbose() >= 1 {
+                    eprintln!(
+                        "Refine #{}: {:.1}s audio, {} tokens, {:.0}ms",
+                        refine_idx,
+                        chunk_start as f32 / SAMPLE_RATE as f32,
+                        ctx.perf_text_tokens,
+                        ctx.perf_total_ms
+                    );
+                }
+                on_refine(
+                    refine_idx,
+                    refined_text,
+                    ctx.perf_total_ms,
+                    ctx.perf_text_tokens,
+                );
+                // The refined text becomes the new baseline for
+                // subsequent streaming chunks.
+                result = refined_text.clone();
+            }
+            next_refine_at = next_refine_at.saturating_add(refine_samples);
+        }
+    }
+
+    // Final refine over the entire audio. This is the authoritative
+    // result; its perf counters are left in ctx.perf_* so the caller's
+    // Done status is consistent with the returned text.
+    refine_idx += 1;
+    let saved_cb = ctx.token_cb.take();
+    let final_text = transcribe_audio(ctx, samples);
+    ctx.token_cb = saved_cb;
+    if let Some(ref t) = final_text {
+        if kernels::verbose() >= 1 {
+            eprintln!(
+                "Final refine #{}: {:.1}s audio, {} tokens, {:.0}ms",
+                refine_idx,
+                samples.len() as f32 / SAMPLE_RATE as f32,
+                ctx.perf_text_tokens,
+                ctx.perf_total_ms
+            );
+        }
+        on_refine(refine_idx, t, ctx.perf_total_ms, ctx.perf_text_tokens);
+    }
+
+    ctx.past_text_conditioning = saved_past_text;
+
+    final_text
+}
+
 /// Streaming transcription: processes audio in chunks, emitting tokens via
 /// `ctx.token_cb` as they become stable.
 ///
@@ -770,7 +1080,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         };
         let tokenizer = load_tokenizer(&ctx.model_dir)?;
         ctx.prepare_prompt_tokens(&tokenizer);
-        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
+        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None, false)?;
         return Some(text);
     }
 
@@ -1225,6 +1535,12 @@ pub struct StreamState {
     // Tokenizer (loaded once)
     tokenizer: Option<QwenTokenizer>,
     prompt_prepared: bool,
+
+    /// 每次调用 stream_push_audio 最多处理的 chunk 数。
+    /// 0 = 无限制（离线模式，一次处理所有积压）。
+    /// >0 = 实时模式，限制每次调用的处理量，避免积压时长时间阻塞
+    /// 导致 UI 不刷新。实时模式建议设为 1。
+    pub max_chunks_per_call: usize,
 }
 
 impl Default for StreamState {
@@ -1254,6 +1570,7 @@ impl StreamState {
             chunk_idx: 0,
             tokenizer: None,
             prompt_prepared: false,
+            max_chunks_per_call: 0,
         }
     }
 
@@ -1277,6 +1594,19 @@ impl StreamState {
         // Keep tokenizer and prompt_prepared
     }
 
+    /// Reset decoder state but advance audio_cursor to `cursor`.
+    ///
+    /// Used after a whole-audio refinement pass (`transcribe_audio`)
+    /// which overwrites `ctx.kv_cache`. The refinement result has
+    /// already been sent to the GUI via `Refined` status; subsequent
+    /// streaming should resume from `cursor` with a clean decoder
+    /// state (no stale KV cache, no token history) so new audio is
+    /// processed correctly.
+    pub fn reset_and_advance_to(&mut self, cursor: usize) {
+        self.reset();
+        self.audio_cursor = cursor;
+    }
+
     /// Get the current stable transcription result.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.result_bytes).into_owned()
@@ -1285,6 +1615,11 @@ impl StreamState {
     /// Get how many samples have been processed so far.
     pub fn audio_cursor(&self) -> usize {
         self.audio_cursor
+    }
+
+    /// Get the current chunk index (number of chunks processed so far).
+    pub fn chunk_idx(&self) -> i32 {
+        self.chunk_idx
     }
 }
 
@@ -1342,7 +1677,18 @@ pub fn stream_push_audio(
     let mut delta_bytes: Vec<u8> = Vec::new();
 
     // ---- Process full chunks, plus remainder if finalizing ----
+    let mut chunks_processed_this_call: usize = 0;
     while state.audio_cursor < samples.len() {
+        // 实时模式：限制每次调用处理的 chunk 数，避免积压时长时间阻塞。
+        // 当推理速度 < 录音速度时，积压会持续增长，但至少每次调用能快速返回，
+        // 让 worker 线程能记录日志、UI 能刷新、用户能看到渐进式结果。
+        if state.max_chunks_per_call > 0
+            && chunks_processed_this_call >= state.max_chunks_per_call
+            && !finalize
+        {
+            break;
+        }
+
         let remaining = samples.len() - state.audio_cursor;
         if remaining < chunk_samples && !finalize {
             break; // Wait for more audio
@@ -1351,6 +1697,7 @@ pub fn stream_push_audio(
         let chunk_t0 = get_time_ms();
         state.audio_cursor = (state.audio_cursor + chunk_samples).min(samples.len());
         let is_final = finalize && state.audio_cursor >= samples.len();
+        chunks_processed_this_call += 1;
 
     // ---- Encoder: only encode new windows ----
     let t0 = get_time_ms();

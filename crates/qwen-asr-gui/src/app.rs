@@ -6,6 +6,8 @@ use crate::sync_ext::safe_lock;
 use crate::worker::{AsrWorker, WorkerStatus};
 use crate::logger;
 use eframe::egui;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub struct AsrApp {
     params: AsrParams,
@@ -20,12 +22,23 @@ pub struct AsrApp {
     profile_text: String,
     copied: bool,
     copy_timer: f32,
+    /// Monotonic counter of completed transcription sessions, used as
+    /// a label in the result textbox so the user can distinguish
+    /// successive recordings (since v0.2 the textbox appends rather
+    /// than replaces).
+    session_idx: u32,
+    /// 实时会话在 result_text 中的起始字节位置。
+    /// Some(pos) = 实时模式，修正/最终结果截断到 pos 后替换；
+    /// None = 非实时模式，Done 时追加。
+    live_text_start: Option<usize>,
 
     // Input mode: file or microphone
     input_mode: InputMode,
 
     // Microphone recording state
     recorder: Option<MicRecorder>,
+    /// 实时识别的停止标志，设置后通知 worker 线程做最终识别
+    live_stop_flag: Option<Arc<AtomicBool>>,
     /// 录音错误信息（若有）
     mic_error: String,
 
@@ -62,8 +75,11 @@ impl AsrApp {
             profile_text: String::new(),
             copied: false,
             copy_timer: 0.0,
+            session_idx: 0,
+            live_text_start: None,
             input_mode: InputMode::File,
             recorder: None,
+            live_stop_flag: None,
             mic_error: String::new(),
             file_dialog_type: FileDialogType::None,
             dialog_pending: false,
@@ -141,6 +157,40 @@ impl AsrApp {
         }
     }
 
+    /// 启动实时录音+识别（从"开始录音"按钮和自动测试模式两处调用）。
+    /// `is_auto=true` 表示自动化测试模式触发，`false` 表示用户手动点击。
+    fn start_live_recording(&mut self, is_auto: bool) {
+        self.mic_error.clear();
+        if is_auto {
+            logger::log_info("自动录音模式: 开始录音（自动化测试）");
+        }
+        match MicRecorder::start() {
+            Ok(rec) => {
+                let sr = rec.sample_rate();
+                let samples_arc = rec.samples_arc();
+                logger::log_info(&format!(
+                    "录音开始 (采样率: {}Hz), 启动实时识别",
+                    sr
+                ));
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                self.live_stop_flag = Some(stop_flag.clone());
+                self.worker.transcribe_live(
+                    samples_arc,
+                    sr,
+                    self.params.clone(),
+                    stop_flag,
+                );
+                self.live_text_start = Some(self.result_text.len());
+                self.recorder = Some(rec);
+                self.status_text = format!("录音中... 0.0s");
+            }
+            Err(e) => {
+                logger::log_error(&format!("录音启动失败: {}", e));
+                self.mic_error = e;
+            }
+        }
+    }
+
     fn poll_worker(&mut self) {
         let status = self.worker.get_status();
         match status {
@@ -154,21 +204,80 @@ impl AsrApp {
                 if self.recorder.is_none() {
                     self.status_text = format!("模型加载完成 ({:.1}s)", sec);
                 }
+                // 自动录音模式：环境变量 QWEN_ASR_AUTO_RECORD=1 时，
+                // 模型加载完成后自动开始录音（用于自动化测试）。
+                if self.recorder.is_none()
+                    && std::env::var("QWEN_ASR_AUTO_RECORD").as_deref() == Ok("1")
+                {
+                    self.start_live_recording(true);
+                }
             }
             WorkerStatus::ModelLoadFailed(ref err) => {
                 self.status_text = format!("错误: {}", err);
                 self.model_loaded = false;
+                // Terminal state — consume it so the next frame goes
+                // back to Idle. Without this the GUI would re-display
+                // the same error every frame.
+                self.worker.consume_status();
             }
             WorkerStatus::LoadingAudio(ref path) => {
                 self.status_text = format!("正在加载音频: {}...", path);
             }
             WorkerStatus::Transcribing => {
+                // 实时文字进文本框（用户需求 #3）：partial_text 写入
+                // result_text（替换式，靠 live_text_start 截断），状态栏
+                // 只显示简短的"识别中..."。
                 let partial = self.worker.get_partial_text();
                 if !partial.is_empty() {
-                    self.status_text = format!("识别中... {}", partial);
-                } else {
-                    self.status_text = "识别中...".into();
+                    if let Some(pos) = self.live_text_start {
+                        // 实时模式：截断到会话起始位置后追加 partial
+                        self.result_text.truncate(pos);
+                        if !self.result_text.is_empty() {
+                            self.result_text.push_str("\n\n");
+                        }
+                        self.result_text.push_str(&partial);
+                    }
+                    // 非实时模式（live_text_start = None）：不修改
+                    // result_text，由 Refined/Done 处理
                 }
+                self.status_text = "识别中...".into();
+            }
+            WorkerStatus::Refined {
+                text,
+                total_ms,
+                text_tokens,
+                refine_idx,
+            } => {
+                // 实时会话期间，每次修正替换本会话之前的内容（不堆积）。
+                // live_text_start = Some(pos) 表示当前在实时会话中：
+                //   截断 result_text 到 pos，再追加本次修正。
+                // live_text_start = None 表示非实时模式（不应发生），退化为追加。
+                let tok_s = if total_ms > 0.0 {
+                    1000.0 * text_tokens as f64 / total_ms
+                } else {
+                    0.0
+                };
+                if !text.is_empty() {
+                    if let Some(pos) = self.live_text_start {
+                        // 替换式：截断到会话起始位置后追加本次修正
+                        self.result_text.truncate(pos);
+                        if !self.result_text.is_empty() {
+                            self.result_text.push_str("\n\n");
+                        }
+                    } else if !self.result_text.is_empty() {
+                        self.result_text.push_str("\n\n");
+                    }
+                    self.result_text.push_str(&format!(
+                        "[修正 #{refine_idx}] {}\n({:.0}ms | {} tokens | {:.2} tok/s)",
+                        text, total_ms, text_tokens, tok_s,
+                    ));
+                }
+                self.status_text = format!(
+                    "修正 #{refine_idx} ({:.0}ms | {} tokens | {:.2} tok/s)",
+                    total_ms, text_tokens, tok_s,
+                );
+                // 消费此修正状态，回到 Transcribing 让 worker 继续
+                self.worker.consume_status();
             }
             WorkerStatus::Done {
                 text,
@@ -177,15 +286,55 @@ impl AsrApp {
                 decode_ms,
                 text_tokens,
             } => {
-                self.result_text = text;
-                let tok_s = if total_ms > 0.0 {
-                    1000.0 * text_tokens as f64 / total_ms
+                // CRITICAL: consume the Done status before doing any
+                // UI work. If we don't, poll_worker() runs every frame
+                // (because is_busy() returns true while the worker is
+                // in any of the non-Idle states, and we never put
+                // ourselves back into Idle), each frame would see
+                // Done{...} again, increment session_idx, and append
+                // the same text into the result textbox — producing
+                // the "infinite repeat" bug seen in v0.1 GUI build
+                // 2026-06-21 23:39:37.
+                self.worker.consume_status();
+
+                // Append the new transcription to the result textbox
+                // instead of replacing it. Each session is separated by
+                // a blank line and a per-segment header with timing
+                // info, so the user can see exactly which line came
+                // from which recording.
+                //
+                // Session counter is a simple monotonic count of Done
+                // events handled by the UI since startup — sufficient
+                // for a GUI label without dragging in a chrono dep.
+                self.session_idx += 1;
+                if !text.is_empty() {
+                    // 实时会话结束时：截断到 live_text_start 替换本会话内容；
+                    // 非实时模式（文件识别）：直接追加。
+                    if let Some(pos) = self.live_text_start.take() {
+                        self.result_text.truncate(pos);
+                        if !self.result_text.is_empty() {
+                            self.result_text.push_str("\n\n");
+                        }
+                    } else if !self.result_text.is_empty() {
+                        self.result_text.push_str("\n\n");
+                    }
+                    let tok_s = if total_ms > 0.0 {
+                        1000.0 * text_tokens as f64 / total_ms
+                    } else {
+                        0.0
+                    };
+                    self.result_text.push_str(&format!(
+                        "[#{}] {}\n({:.0}ms | {} tokens | {:.2} tok/s)",
+                        self.session_idx, text, total_ms, text_tokens, tok_s,
+                    ));
                 } else {
-                    0.0
-                };
+                    // 即使最终结果为空，也要消费 live_text_start 以退出实时模式
+                    self.live_text_start = None;
+                }
                 self.status_text = format!(
                     "完成: {:.0}ms (编码 {:.0}ms, 解码 {:.0}ms) | {} tokens ({:.2} tok/s)",
-                    total_ms, encode_ms, decode_ms, text_tokens, tok_s
+                    total_ms, encode_ms, decode_ms, text_tokens,
+                    if total_ms > 0.0 { 1000.0 * text_tokens as f64 / total_ms } else { 0.0 }
                 );
 
                 // Update profile
@@ -196,6 +345,9 @@ impl AsrApp {
             }
             WorkerStatus::Error(ref err) => {
                 self.status_text = format!("错误: {}", err);
+                // Same reasoning as ModelLoadFailed: reset to Idle so
+                // the error doesn't replay on every frame.
+                self.worker.consume_status();
             }
         }
     }
@@ -215,15 +367,12 @@ impl eframe::App for AsrApp {
         self.handle_file_dialog(ctx);
 
         // Update recording status (before panels render)
+        // 用户需求 #3：状态栏只显示简短状态（"录音中... X.Xs"），
+        // 实时识别文字由 poll_worker() 的 Transcribing 分支写入 result_text。
         if self.recorder.is_some() {
             if let Some(ref rec) = self.recorder {
                 let elapsed = rec.elapsed_sec();
-                let samples = rec.sample_count();
-                let sr = rec.sample_rate();
-                self.status_text = format!(
-                    "录音中... {:.1}s ({}Hz, {} 样本)",
-                    elapsed, sr, samples
-                );
+                self.status_text = format!("录音中... {:.1}s", elapsed);
             }
         }
 
@@ -377,26 +526,11 @@ impl eframe::App for AsrApp {
                                         self.model_loaded,
                                         egui::Button::new("开始录音"),
                                     )
-                                    .on_hover_text("点击后开始从麦克风录音")
+                                    .on_hover_text("点击后开始从麦克风录音，录音中自动实时识别")
                                     .clicked()
                                 {
-                                    self.mic_error.clear();
                                     logger::log_info("用户点击: 开始录音");
-                                    match MicRecorder::start() {
-                                        Ok(rec) => {
-                                            logger::log_info(&format!(
-                                                "录音开始 (采样率: {}Hz)",
-                                                rec.sample_rate()
-                                            ));
-                                            self.recorder = Some(rec);
-                                            self.status_text =
-                                                format!("录音中... 0.0s");
-                                        }
-                                        Err(e) => {
-                                            logger::log_error(&format!("录音启动失败: {}", e));
-                                            self.mic_error = e;
-                                        }
-                                    }
+                                    self.start_live_recording(false);
                                 }
                                 if !self.model_loaded {
                                     ui.label(
@@ -408,46 +542,29 @@ impl eframe::App for AsrApp {
                                 // Recording: show "停止录音" button
                                 if ui
                                     .add(
-                                        egui::Button::new("停止录音并识别")
+                                        egui::Button::new("停止录音")
                                             .fill(egui::Color32::from_rgb(200, 80, 80)),
                                     )
+                                    .on_hover_text("停止录音并做最终识别")
                                     .clicked()
                                 {
-                                    logger::log_info("用户点击: 停止录音并识别");
-                                    if let Some(rec) = self.recorder.take() {
-                                        let (samples, sr) = rec.stop();
-                                        if samples.is_empty() {
-                                            logger::log_warn("录音为空，无数据可识别");
-                                            self.mic_error = "录音为空".into();
-                                        } else {
-                                            // Resample to 16kHz if needed
-                                            let samples_16k = if sr != 16000 {
-                                                logger::log_info(&format!(
-                                                    "重采样: {}Hz -> 16000Hz",
-                                                    sr
-                                                ));
-                                                qwen_asr::audio::resample(
-                                                    &samples,
-                                                    sr as i32,
-                                                    16000,
-                                                )
-                                            } else {
-                                                samples
-                                            };
-                                            let dur = samples_16k.len() as f32 / 16000.0;
-                                            logger::log_info(&format!(
-                                                "录音完成 ({:.1}s, {} 样本), 开始识别",
-                                                dur,
-                                                samples_16k.len()
-                                            ));
-                                            self.status_text =
-                                                format!("录音完成 ({:.1}s)，正在识别...", dur);
-                                            self.worker.transcribe_samples(
-                                                samples_16k,
-                                                self.params.clone(),
-                                            );
-                                        }
+                                    logger::log_info("用户点击: 停止录音");
+                                    // 通知实时识别线程做最终识别
+                                    if let Some(flag) = &self.live_stop_flag {
+                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
+                                    self.live_stop_flag = None;
+                                    // 停止录音（drop stream）；worker 线程仍持有
+                                    // samples Arc，可读取最终样本做最终识别
+                                    if let Some(rec) = self.recorder.take() {
+                                        let sr = rec.sample_rate();
+                                        let _ = rec.stop(); // 停止采集
+                                        logger::log_info(&format!(
+                                            "录音停止 (采样率: {}Hz), 等待最终识别",
+                                            sr
+                                        ));
+                                    }
+                                    self.status_text = "录音已停止，正在做最终识别...".into();
                                 }
                             }
                         }
@@ -505,6 +622,22 @@ impl eframe::App for AsrApp {
                             ui.add(
                                 egui::DragValue::new(&mut self.params.stream_chunk_sec)
                                     .range(-1.0..=30.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("二次修正");
+                            ui.checkbox(&mut self.params.refine_enabled, "启用")
+                                .on_hover_text(
+                                    "流式草稿 + 定期整块重识别\n\
+                                     兼顾实时性与精度",
+                                );
+                            ui.end_row();
+
+                            ui.label("修正间隔(s)");
+                            ui.add_enabled(
+                                self.params.refine_enabled,
+                                egui::DragValue::new(&mut self.params.refine_interval_sec)
+                                    .range(5.0..=120.0),
                             );
                             ui.end_row();
 
@@ -579,15 +712,28 @@ impl eframe::App for AsrApp {
 
             ui.add_space(4.0);
 
-            // Result text area
+            // Result text area — wrapped in a vertical ScrollArea so
+            // long transcripts (multi-recording session) get a scroll
+            // bar instead of growing past the viewport. The text
+            // itself is editable, and the scroll position auto-sticks
+            // to the bottom so the user always sees the latest result.
             let text_style = egui::TextStyle::Monospace;
             let mut text = self.result_text.clone();
-            let text_edit = egui::TextEdit::multiline(&mut text)
-                .desired_width(f32::MAX)
-                .desired_rows(10)
-                .font(text_style)
-                .interactive(true);
-            ui.add(text_edit);
+            let mut scroll = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true);
+            // Only auto-scroll when the user hasn't scrolled away
+            // from the bottom; this preserves manual scroll position
+            // when reviewing older results.
+            scroll = scroll.animated(false);
+            scroll.show(ui, |ui| {
+                let text_edit = egui::TextEdit::multiline(&mut text)
+                    .desired_width(f32::MAX)
+                    .desired_rows(10)
+                    .font(text_style)
+                    .interactive(true);
+                ui.add(text_edit);
+            });
             // Update if user edited
             if text != self.result_text {
                 self.result_text = text;
@@ -622,5 +768,295 @@ fn shorten_path(path: &str, max_len: usize) -> String {
     } else {
         let start = path.len().saturating_sub(max_len - 3);
         format!("...{}", &path[start..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 文本框显示状态机的单元测试。
+    //!
+    //! 这些测试直接调用 `AsrApp::poll_worker()`，验证 `Refined`/`Done`
+    //! 事件在实时模式（`live_text_start = Some`）和文件模式（`None`）下
+    //! 对 `result_text` 的修改行为是否符合预期：
+    //!   - 实时模式：修正/最终结果替换本会话之前的内容（不堆积）
+    //!   - 文件模式：每次 Done 追加（会话之间分隔）
+    //!   - 实时模式结束后 `live_text_start` 回到 `None`
+    //!   - 之前会话的内容不被破坏
+    use super::*;
+
+    fn make_app() -> AsrApp {
+        AsrApp::new(None)
+    }
+
+    /// 实时会话中多次 Refined 应该替换而非堆积。
+    #[test]
+    fn live_session_refined_events_replace_not_accumulate() {
+        let mut app = make_app();
+        // 模拟录音开始：result_text 为空，起始位置 = 0
+        app.live_text_start = Some(0);
+
+        // 第一次修正
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "alpha draft".into(),
+            total_ms: 1000.0,
+            text_tokens: 10,
+            refine_idx: 1,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("alpha draft"),
+            "第一次修正应出现: {:?}",
+            app.result_text
+        );
+        assert!(
+            !app.result_text.contains("beta draft"),
+            "第二次修正不应出现: {:?}",
+            app.result_text
+        );
+        let len_after_first = app.result_text.len();
+        assert!(len_after_first > 0);
+
+        // 第二次修正应替换第一次
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "beta draft".into(),
+            total_ms: 2000.0,
+            text_tokens: 20,
+            refine_idx: 2,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("beta draft"),
+            "第二次修正应出现: {:?}",
+            app.result_text
+        );
+        assert!(
+            !app.result_text.contains("alpha draft"),
+            "第一次修正应被截断: {:?}",
+            app.result_text
+        );
+
+        // Done 应替换第二次修正
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "gamma final".into(),
+            total_ms: 3000.0,
+            encode_ms: 1000.0,
+            decode_ms: 2000.0,
+            text_tokens: 30,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("gamma final"),
+            "最终结果应出现: {:?}",
+            app.result_text
+        );
+        assert!(
+            !app.result_text.contains("beta draft"),
+            "第二次修正应被 Done 截断: {:?}",
+            app.result_text
+        );
+        assert!(
+            app.live_text_start.is_none(),
+            "Done 后 live_text_start 应为 None"
+        );
+    }
+
+    /// 文件模式（非实时）：Done 应追加而非替换。
+    #[test]
+    fn file_mode_done_appends_not_replaces() {
+        let mut app = make_app();
+        // live_text_start 为 None（默认）= 文件模式
+
+        // 第一次会话
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "file one".into(),
+            total_ms: 1000.0,
+            encode_ms: 500.0,
+            decode_ms: 500.0,
+            text_tokens: 10,
+        });
+        app.poll_worker();
+        assert!(app.result_text.contains("file one"));
+
+        // 第二次会话应追加
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "file two".into(),
+            total_ms: 2000.0,
+            encode_ms: 1000.0,
+            decode_ms: 1000.0,
+            text_tokens: 20,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("file one"),
+            "文件模式应保留之前会话: {:?}",
+            app.result_text
+        );
+        assert!(app.result_text.contains("file two"));
+    }
+
+    /// 实时会话应保留之前会话的内容，仅替换本会话部分。
+    #[test]
+    fn live_session_preserves_previous_content() {
+        let mut app = make_app();
+
+        // 先有一个文件模式会话留下内容
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "previous file".into(),
+            total_ms: 1000.0,
+            encode_ms: 500.0,
+            decode_ms: 500.0,
+            text_tokens: 10,
+        });
+        app.poll_worker();
+        assert!(app.result_text.contains("previous file"));
+
+        // 开始实时会话
+        app.live_text_start = Some(app.result_text.len());
+
+        // 第一次修正
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "live draft one".into(),
+            total_ms: 1000.0,
+            text_tokens: 10,
+            refine_idx: 1,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("previous file"),
+            "之前会话内容应保留: {:?}",
+            app.result_text
+        );
+        assert!(app.result_text.contains("live draft one"));
+
+        // 第二次修正只替换实时部分
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "live draft two".into(),
+            total_ms: 2000.0,
+            text_tokens: 20,
+            refine_idx: 2,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("previous file"),
+            "之前会话内容仍应保留: {:?}",
+            app.result_text
+        );
+        assert!(app.result_text.contains("live draft two"));
+        assert!(
+            !app.result_text.contains("live draft one"),
+            "第一次修正应被替换: {:?}",
+            app.result_text
+        );
+
+        // Done
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "live final".into(),
+            total_ms: 3000.0,
+            encode_ms: 1000.0,
+            decode_ms: 2000.0,
+            text_tokens: 30,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("previous file"),
+            "Done 后之前会话内容应保留: {:?}",
+            app.result_text
+        );
+        assert!(app.result_text.contains("live final"));
+        assert!(
+            !app.result_text.contains("live draft two"),
+            "修正应被 Done 替换: {:?}",
+            app.result_text
+        );
+        assert!(app.live_text_start.is_none());
+    }
+
+    /// 实时模式下 Done 收到空文本应清除 live_text_start。
+    #[test]
+    fn live_session_done_empty_text_clears_live_state() {
+        let mut app = make_app();
+        app.live_text_start = Some(0);
+
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "".into(),
+            total_ms: 0.0,
+            encode_ms: 0.0,
+            decode_ms: 0.0,
+            text_tokens: 0,
+        });
+        app.poll_worker();
+        assert!(
+            app.live_text_start.is_none(),
+            "空 Done 也应清除 live_text_start"
+        );
+        assert!(
+            app.result_text.is_empty(),
+            "空文本不应追加任何内容: {:?}",
+            app.result_text
+        );
+    }
+
+    /// 多次实时会话应各自独立替换，不互相干扰。
+    #[test]
+    fn multiple_live_sessions_are_independent() {
+        let mut app = make_app();
+
+        // 第一次实时会话
+        app.live_text_start = Some(0);
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "session1 refine".into(),
+            total_ms: 1000.0,
+            text_tokens: 10,
+            refine_idx: 1,
+        });
+        app.poll_worker();
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "session1 final".into(),
+            total_ms: 2000.0,
+            encode_ms: 1000.0,
+            decode_ms: 1000.0,
+            text_tokens: 20,
+        });
+        app.poll_worker();
+        assert!(app.result_text.contains("session1 final"));
+        assert!(app.live_text_start.is_none());
+
+        // 第二次实时会话
+        app.live_text_start = Some(app.result_text.len());
+        app.worker.state.set_status(WorkerStatus::Refined {
+            text: "session2 refine".into(),
+            total_ms: 1000.0,
+            text_tokens: 10,
+            refine_idx: 1,
+        });
+        app.poll_worker();
+        app.worker.state.set_status(WorkerStatus::Done {
+            text: "session2 final".into(),
+            total_ms: 2000.0,
+            encode_ms: 1000.0,
+            decode_ms: 1000.0,
+            text_tokens: 20,
+        });
+        app.poll_worker();
+        assert!(
+            app.result_text.contains("session1 final"),
+            "第一次会话最终结果应保留: {:?}",
+            app.result_text
+        );
+        assert!(
+            app.result_text.contains("session2 final"),
+            "第二次会话最终结果应出现: {:?}",
+            app.result_text
+        );
+        assert!(
+            !app.result_text.contains("session1 refine"),
+            "第一次会话的中间修正应已被替换: {:?}",
+            app.result_text
+        );
+        assert!(
+            !app.result_text.contains("session2 refine"),
+            "第二次会话的中间修正应已被替换: {:?}",
+            app.result_text
+        );
     }
 }

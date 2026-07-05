@@ -9,6 +9,7 @@ These files collect the historical diaries and protocols from the autoresearch o
 | [`experiments.md`](./experiments.md) | Merged optimization experiment diaries: first speed sweep, second structural speed sweep, WER recovery, and perf-round2 vs. previous implementation. |
 | [`ledger.md`](./ledger.md) | Ledger of major autoresearch commits and their measured RTF gains. |
 | [`programs.md`](./programs.md) | Merged autoresearch protocols: original program and Codex-focused program with opportunity backlog. |
+| [`onednn-conv2d-path.md`](./onednn-conv2d-path.md) | T-ONEDNN-001: oneDNN `conv2d_op` 实现路径调研，含能力匹配、集成方案、收益风险与下一步行动。 |
 
 ## How to use these logs
 

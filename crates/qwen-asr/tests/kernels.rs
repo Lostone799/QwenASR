@@ -123,6 +123,87 @@ fn test_silu() {
     assert!(err < 1e-5, "SiLU mismatch, max_err={}", err);
 }
 
+#[cfg(windows)]
+#[test]
+fn test_onednn_init() {
+    // The oneDNN DLL must be discoverable and all required symbols present.
+    assert!(
+        kernels::onednn::onednn_available(),
+        "oneDNN runtime (dnnl.dll) should be available on Windows"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn conv2d_onednn_matches_reference() {
+    let c_in = 2usize;
+    let c_out = 3usize;
+    let h_in = 5usize;
+    let w_in = 5usize;
+    let kh = 3usize;
+    let kw = 3usize;
+    let stride = 2usize;
+    let padding = 1usize;
+    let h_out = (h_in + 2 * padding - kh) / stride + 1;
+    let w_out = (w_in + 2 * padding - kw) / stride + 1;
+
+    let input: Vec<f32> = (0..c_in * h_in * w_in).map(|i| (i as f32) * 0.01 - 0.5).collect();
+    let weight: Vec<f32> = (0..c_out * c_in * kh * kw).map(|i| (i as f32) * 0.001 - 0.1).collect();
+    let bias: Vec<f32> = (0..c_out).map(|i| (i as f32) * 0.1).collect();
+
+    let mut expected = vec![0.0f32; c_out * h_out * w_out];
+    for oc in 0..c_out {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                let mut sum = bias[oc];
+                for ic in 0..c_in {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let ih = (oh * stride + ki) as isize - padding as isize;
+                            let iw = (ow * stride + kj) as isize - padding as isize;
+                            let val = if ih >= 0
+                                && (ih as usize) < h_in
+                                && iw >= 0
+                                && (iw as usize) < w_in
+                            {
+                                input[ic * h_in * w_in + ih as usize * w_in + iw as usize]
+                            } else {
+                                0.0
+                            };
+                            let wp = ic * kh * kw + ki * kw + kj;
+                            sum += val * weight[oc * c_in * kh * kw + wp];
+                        }
+                    }
+                }
+                expected[oc * h_out * w_out + oh * w_out + ow] = sum;
+            }
+        }
+    }
+
+    let mut out = vec![0.0f32; c_out * h_out * w_out];
+    kernels::conv2d(
+        &mut out,
+        &input,
+        &weight,
+        Some(&bias),
+        c_in,
+        c_out,
+        h_in,
+        w_in,
+        kh,
+        kw,
+        stride,
+        padding,
+    );
+
+    let err = max_abs_err(&out, &expected);
+    assert!(
+        err < 1e-4,
+        "conv2d (oneDNN path if available) mismatch: max_err={}",
+        err
+    );
+}
+
 #[test]
 fn test_vec_ops() {
     let n = 256;

@@ -2758,6 +2758,7 @@ name = "qwen-asr"
 version = "0.7.2"
 dependencies = [
  "libc",
+ "libloading",
  "memmap2",
 ]
 
